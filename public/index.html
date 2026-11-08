@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Magnata Brasil</title>
+
+  <!-- TailwindCSS via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Lucide Icons via CDN -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <!-- Google Font: Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap"
+    rel="stylesheet"
+  />
+
+  <!-- Socket.io client (served by the Magnata Brasil server) -->
+  <script src="/socket.io/socket.io.js"></script>
+
+  <style>
+    html, body { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body {
+      background:
+        radial-gradient(circle at 20% 20%, rgba(56, 189, 248, 0.12), transparent 40%),
+        radial-gradient(circle at 80% 80%, rgba(168, 85, 247, 0.12), transparent 40%),
+        linear-gradient(160deg, #0b1220 0%, #111827 50%, #0b1220 100%);
+    }
+    @keyframes pulseLogo {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.04); opacity: 0.85; }
+    }
+    .logo-pulse { animation: pulseLogo 1.8s ease-in-out infinite; }
+  </style>
+</head>
+<body class="min-h-screen text-slate-100 flex items-center justify-center">
+  <main class="text-center px-6">
+    <h1 class="logo-pulse text-5xl sm:text-6xl font-black tracking-tight
+               bg-gradient-to-r from-amber-300 via-yellow-200 to-amber-400
+               bg-clip-text text-transparent drop-shadow-[0_4px_24px_rgba(251,191,36,0.25)]">
+      Magnata Brasil
+    </h1>
+    <p class="mt-4 text-slate-400 text-lg">Carregando...</p>
+    <div class="mt-6 flex justify-center">
+      <span class="inline-block h-2 w-2 rounded-full bg-amber-400/80 animate-ping"></span>
+    </div>
+  </main>
+</body>
+</html>
