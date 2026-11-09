@@ -218,16 +218,416 @@ const io = new Server(httpServer, {
   /* cors e path usam os defaults do Socket.io (path /socket.io). */
 });
 
-/* Repositorios em memoria de salas e partidas (preenchidos pelo FEAT-002/003/005). */
-const rooms = new Map();   // roomId -> { id, name, hostId, password, players: [], started }
-const games = new Map();   // roomId -> gameState (createInitialGameState(...))
+/* =========================================================================
+ * Repositorios em memoria de salas e partidas (FEAT-002 em diante).
+ * Salas (rooms): roomId -> room. Partidas (games): roomId -> gameState.
+ * socketToRoom: indice reverso socketId -> { roomId, playerId } para lookup
+ * rapido em disconnect/leaveRoom.
+ * ========================================================================= */
+const MAX_PLAYERS = 6;
+const ALLOWED_COLORS = ['Vermelho', 'Azul', 'Verde', 'Amarelo', 'Roxo', 'Laranja'];
+
+const rooms = new Map();       // roomId -> room
+const games = new Map();       // roomId -> gameState (createInitialGameState + jogadores ligados)
+const socketToRoom = new Map(); // socketId -> { roomId, playerId }
+
+/* -------------------------------------------------------------------------
+ * Helpers de sala / estado sanitizado.
+ *
+ * SEGURANCA: o estado enviado ao cliente (joinedRoom/roomState/gameState e
+ * roomsListUpdate) NUNCA inclui a senha da sala. Apenas o booleano
+ * hasPassword e exposto em roomsListUpdate; a string da senha e validada
+ * exclusivamente no servidor, dentro do handler joinRoom.
+ *
+ * Formato de uma sala:
+ *   { id, name, password (''|string), hostPlayerId, players: Map<playerId, player>,
+ *     maxPlayers, status: 'lobby'|'playing' }
+ * Formato de um jogador (na sala - somente identidade/lobby):
+ *   { id (sessionId), nickname, socketId, color, connected, lastSeen }
+ * O estado de jogo (saldo, posicao, propriedades, prisao, etc.) vive no
+ * gameState (games Map) e e mesclado na visao sanitizada quando status==='playing'.
+ * ------------------------------------------------------------------------- */
+function getHostNickname(room) {
+  if (!room) return '';
+  const host = room.players.get(room.hostPlayerId);
+  return host ? host.nickname : '';
+}
+
+function isColorTaken(room, color, exceptPlayerId) {
+  if (!room) return false;
+  for (const [pid, p] of room.players) {
+    if (pid === exceptPlayerId) continue;
+    if (p.color === color) return true;
+  }
+  return false;
+}
+
+function genRoomId() {
+  let id;
+  do {
+    id = Math.random().toString(36).slice(2, 8).padEnd(6, '0');
+  } while (rooms.has(id));
+  return id;
+}
+
+// Resolve nickname + sessionId a partir do payload do evento e/ou socket.data.
+function resolveIdentity(socket, payload) {
+  const p = payload || {};
+  const data = socket.data || {};
+  let nickname = '';
+  if (p.nickname != null) nickname = String(p.nickname).trim();
+  else if (data.nickname != null) nickname = String(data.nickname).trim();
+  let sessionId = '';
+  if (p.sessionId != null) sessionId = String(p.sessionId);
+  else if (data.sessionId != null) sessionId = String(data.sessionId);
+  if (!sessionId) sessionId = socket.id;
+  return { nickname, sessionId };
+}
+
+// Estado sanitizado enviado em joinedRoom/roomState/gameState. Sem senha.
+function sanitizeRoomState(room) {
+  const game = room ? games.get(room.id) : null;
+  const players = [];
+  if (room) {
+    for (const [pid, p] of room.players) {
+      const gp = game ? game.players.find((x) => x.id === pid) : null;
+      players.push({
+        id: p.id,
+        nickname: p.nickname,
+        color: p.color,
+        balance: gp ? gp.balance : 2558,
+        position: gp ? gp.position : 0,
+        bankrupt: gp ? gp.bankrupt : false,
+        inJail: gp ? gp.inJail : false,
+        connected: p.connected,
+        properties: gp ? gp.properties : {},
+        getOutJailFreeCards: gp ? gp.getOutJailFreeCards : 0
+      });
+    }
+  }
+  const ownership = {};
+  if (game) {
+    for (const gp of game.players) {
+      const props = gp.properties || {};
+      for (const spaceIndex of Object.keys(props)) {
+        ownership[spaceIndex] = gp.id;
+      }
+    }
+  }
+  return {
+    roomId: room ? room.id : null,
+    name: room ? room.name : '',
+    hostNickname: getHostNickname(room),
+    status: room ? room.status : 'lobby',
+    players,
+    currentPlayerIndex: game ? game.currentPlayerIndex : 0,
+    turnPhase: game ? game.turnPhase : null,
+    dice: game ? game.dice : [1, 1],
+    lastRoll: game ? game.lastRoll : null,
+    doublesCount: game ? game.doublesCount : 0,
+    pendingDecision: game ? game.pendingDecision : null,
+    ownership,
+    log: game ? (game.log || []) : []
+  };
+}
+
+// Lista publica de salas (roomsListUpdate). Sem senha - apenas hasPassword.
+function buildRoomsList() {
+  const list = [];
+  for (const r of rooms.values()) {
+    list.push({
+      roomId: r.id,
+      roomName: r.name,
+      hostNickname: getHostNickname(r),
+      playerCount: r.players.size,
+      maxPlayers: r.maxPlayers,
+      status: r.status,
+      hasPassword: r.password !== ''
+    });
+  }
+  return list;
+}
+
+function broadcastRoomsList() {
+  io.emit('roomsListUpdate', buildRoomsList());
+}
 
 io.on('connection', (socket) => {
-  // Manipuladores de lobby/conn/reconexao e motor de turnos sao adicionados
-  // pelos recursos subsequentes (FEAT-002, FEAT-003, FEAT-005).
-  socket.on('disconnect', () => {
-    // A logica de remocao/reconexao e tratada no FEAT-002.
+  /* ---- Identificacao (nickname + sessionId persistido no cliente) ---- */
+  socket.on('setNickname', (payload) => {
+    const p = payload || {};
+    const nickname = (p.nickname != null ? String(p.nickname) : '').trim();
+    if (!nickname) {
+      socket.emit('error', { message: 'Nickname obrigatorio.' });
+      return;
+    }
+    const sessionId = (p.sessionId != null ? String(p.sessionId) : '') || socket.id;
+    socket.data = socket.data || {};
+    socket.data.nickname = nickname;
+    socket.data.sessionId = sessionId;
   });
+
+  /* ---- Criacao de sala ---- */
+  socket.on('createRoom', (payload) => {
+    const p = payload || {};
+    const roomName = (p.roomName != null ? String(p.roomName) : '').trim();
+    if (!roomName) {
+      socket.emit('error', { message: 'Nome da sala e obrigatorio.' });
+      return;
+    }
+    const { nickname, sessionId } = resolveIdentity(socket, p);
+    if (!nickname) {
+      socket.emit('error', { message: 'Nickname obrigatorio.' });
+      return;
+    }
+    for (const r of rooms.values()) {
+      if (r.name.toLowerCase() === roomName.toLowerCase()) {
+        socket.emit('error', { message: 'Ja existe uma sala com esse nome.' });
+        return;
+      }
+    }
+    if (socketToRoom.has(socket.id)) {
+      socket.emit('error', { message: 'Voce ja esta em uma sala.' });
+      return;
+    }
+    const roomId = genRoomId();
+    const playerId = sessionId;
+    const room = {
+      id: roomId,
+      name: roomName,
+      password: p.password != null ? String(p.password) : '',
+      hostPlayerId: playerId,
+      players: new Map(),
+      maxPlayers: MAX_PLAYERS,
+      status: 'lobby'
+    };
+    const player = {
+      id: playerId,
+      nickname,
+      socketId: socket.id,
+      color: null,
+      connected: true,
+      lastSeen: Date.now()
+    };
+    room.players.set(playerId, player);
+    rooms.set(roomId, room);
+    socketToRoom.set(socket.id, { roomId, playerId });
+    socket.join(roomId);
+    socket.emit('joinedRoom', { roomId, playerId, room: sanitizeRoomState(room) });
+    broadcastRoomsList();
+  });
+
+  /* ---- Entrada em sala (senha validada no servidor) / reconexao ---- */
+  socket.on('joinRoom', (payload) => {
+    const p = payload || {};
+    const roomId = p.roomId != null ? String(p.roomId) : '';
+    const room = rooms.get(roomId);
+    if (!room) {
+      socket.emit('error', { message: 'Sala nao encontrada' });
+      return;
+    }
+    const { nickname, sessionId } = resolveIdentity(socket, p);
+    if (!nickname) {
+      socket.emit('error', { message: 'Nickname obrigatorio.' });
+      return;
+    }
+    // Reconexao: jogador ja existente na sala (mesmo sessionId) ignora a senha.
+    const existing = room.players.get(sessionId);
+    if (existing) {
+      existing.socketId = socket.id;
+      existing.connected = true;
+      existing.lastSeen = Date.now();
+      if (nickname) existing.nickname = nickname;
+      socketToRoom.set(socket.id, { roomId, playerId: existing.id });
+      socket.join(roomId);
+      socket.emit('joinedRoom', { roomId, playerId: existing.id, room: sanitizeRoomState(room) });
+      io.to(roomId).emit('roomState', sanitizeRoomState(room));
+      broadcastRoomsList();
+      return;
+    }
+    // Novo membro: valida senha no servidor (critico para seguranca).
+    if (room.password !== '' && (p.password != null ? String(p.password) : '') !== room.password) {
+      socket.emit('error', { message: 'Senha incorreta!' });
+      return;
+    }
+    if (room.players.size >= room.maxPlayers) {
+      socket.emit('error', { message: 'Sala lotada' });
+      return;
+    }
+    if (socketToRoom.has(socket.id)) {
+      socket.emit('error', { message: 'Voce ja esta em uma sala.' });
+      return;
+    }
+    const playerId = sessionId;
+    let color = null;
+    if (p.color != null) {
+      const c = String(p.color);
+      if (ALLOWED_COLORS.includes(c) && !isColorTaken(room, c, null)) color = c;
+    }
+    const player = {
+      id: playerId,
+      nickname,
+      socketId: socket.id,
+      color,
+      connected: true,
+      lastSeen: Date.now()
+    };
+    room.players.set(playerId, player);
+    socketToRoom.set(socket.id, { roomId, playerId });
+    socket.join(roomId);
+    socket.emit('joinedRoom', { roomId, playerId, room: sanitizeRoomState(room) });
+    io.to(roomId).emit('roomState', sanitizeRoomState(room));
+    broadcastRoomsList();
+  });
+
+  /* ---- Selecao de cor do peao ---- */
+  socket.on('selectColor', (payload) => {
+    const reg = socketToRoom.get(socket.id);
+    if (!reg) {
+      socket.emit('error', { message: 'Voce nao esta em uma sala.' });
+      return;
+    }
+    const room = rooms.get(reg.roomId);
+    if (!room) return;
+    const player = room.players.get(reg.playerId);
+    if (!player) return;
+    const color = payload && payload.color != null ? String(payload.color) : '';
+    if (!ALLOWED_COLORS.includes(color)) {
+      socket.emit('error', { message: 'Cor invalida.' });
+      return;
+    }
+    if (isColorTaken(room, color, player.id)) {
+      socket.emit('error', { message: 'Cor ja escolhida por outro jogador.' });
+      return;
+    }
+    player.color = color;
+    io.to(room.id).emit('roomState', sanitizeRoomState(room));
+  });
+
+  /* ---- Inicio de partida (apenas anfitriao, >=2 jogadores) ---- */
+  socket.on('startGame', () => {
+    const reg = socketToRoom.get(socket.id);
+    if (!reg) {
+      socket.emit('error', { message: 'Voce nao esta em uma sala.' });
+      return;
+    }
+    const room = rooms.get(reg.roomId);
+    if (!room) return;
+    if (room.hostPlayerId !== reg.playerId) {
+      socket.emit('error', { message: 'Apenas o anfitriao pode iniciar a partida.' });
+      return;
+    }
+    if (room.players.size < 2) {
+      socket.emit('error', { message: 'Sao necessarios pelo menos 2 jogadores.' });
+      return;
+    }
+    if (room.status === 'playing') {
+      socket.emit('error', { message: 'A partida ja comecou.' });
+      return;
+    }
+    const count = room.players.size;
+    const gs = createInitialGameState(count);
+    let i = 0;
+    for (const [pid, p] of room.players) {
+      const gp = gs.players[i];
+      gp.id = p.id;
+      gp.nickname = p.nickname;
+      gp.color = p.color;
+      gp.connected = p.connected;
+      gp.balance = 2558;
+      gp.position = 0;
+      gp.properties = {};
+      gp.getOutJailFreeCards = 0;
+      gp.inJail = false;
+      gp.jailTurns = 0;
+      gp.bankrupt = false;
+      i++;
+    }
+    games.set(room.id, gs);
+    room.status = 'playing';
+    broadcastRoomsList();
+    io.to(room.id).emit('gameState', sanitizeRoomState(room));
+  });
+
+  /* ---- Saida voluntaria da sala ---- */
+  socket.on('leaveRoom', () => {
+    const reg = socketToRoom.get(socket.id);
+    if (!reg) {
+      socket.emit('error', { message: 'Voce nao esta em uma sala.' });
+      return;
+    }
+    const room = rooms.get(reg.roomId);
+    socketToRoom.delete(socket.id);
+    socket.leave(reg.roomId);
+    if (room) {
+      const player = room.players.get(reg.playerId);
+      if (room.status === 'lobby') {
+        room.players.delete(reg.playerId);
+        if (room.hostPlayerId === reg.playerId) {
+          const next = room.players.keys().next().value;
+          if (next) room.hostPlayerId = next;
+        }
+        if (room.players.size === 0) {
+          rooms.delete(room.id);
+          games.delete(room.id);
+          broadcastRoomsList();
+          socket.emit('leftRoom', { ok: true });
+          return;
+        }
+        io.to(room.id).emit('roomState', sanitizeRoomState(room));
+        broadcastRoomsList();
+      } else if (player) {
+        player.connected = false;
+        io.to(room.id).emit('roomState', sanitizeRoomState(room));
+        broadcastRoomsList();
+      }
+    }
+    socket.emit('leftRoom', { ok: true });
+  });
+
+  /* ---- Lista de salas para clientes recem-conectados ---- */
+  socket.on('getRooms', () => {
+    socket.emit('roomsListUpdate', buildRoomsList());
+  });
+
+  /* ---- Desconexao ---- */
+  socket.on('disconnect', () => {
+    const reg = socketToRoom.get(socket.id);
+    if (!reg) return;
+    socketToRoom.delete(socket.id);
+    const room = rooms.get(reg.roomId);
+    if (!room) return;
+    const player = room.players.get(reg.playerId);
+    if (!player) return;
+    if (room.status === 'lobby') {
+      // No lobby: remove o jogador; reatribui host ou fecha a sala se vazia.
+      room.players.delete(reg.playerId);
+      if (room.hostPlayerId === reg.playerId) {
+        const next = room.players.keys().next().value;
+        if (next) room.hostPlayerId = next;
+      }
+      if (room.players.size === 0) {
+        rooms.delete(room.id);
+        games.delete(room.id);
+        broadcastRoomsList();
+        return;
+      }
+      io.to(room.id).emit('roomState', sanitizeRoomState(room));
+      broadcastRoomsList();
+    } else {
+      // Em partida: mantem o estado do jogador para reconexao (nao remove).
+      player.connected = false;
+      player.lastSeen = Date.now();
+      io.to(room.id).emit('roomState', sanitizeRoomState(room));
+      broadcastRoomsList();
+    }
+  });
+
+  /* ----------------------------------------------------------------------
+   * FEAT-003 implementara o motor de turnos (rollDice, buyDecision, build,
+   * mortgage, trade, jail, etc.). Nada aqui lanca (throw) -- o servidor
+   * continua funcionando e o lobby esta completo apos FEAT-002.
+   * ---------------------------------------------------------------------- */
 });
 
 const PORT = process.env.PORT || 3000;
@@ -235,7 +635,8 @@ httpServer.listen(PORT, () => {
   console.log(`Magnata Brasil servidor rodando em http://localhost:${PORT}`);
 });
 
-/* Exporta a camada de dados e helpers para uso/teste por outros modulos. */
+/* Exporta a camada de dados, helpers e a fachada io/rooms/games para uso/teste
+ * por outros modulos (incluindo o smoke test com stubs de FEAT-002). */
 module.exports = {
   TURN_PHASE,
   COLOR_GROUPS,
@@ -244,5 +645,17 @@ module.exports = {
   CHANCE_CARDS,
   shuffle,
   createInitialGameState,
-  createPlayerSkeleton
+  createPlayerSkeleton,
+  // FEAT-002: lobby / reconn
+  ALLOWED_COLORS,
+  MAX_PLAYERS,
+  io,
+  rooms,
+  games,
+  socketToRoom,
+  sanitizeRoomState,
+  buildRoomsList,
+  getHostNickname,
+  isColorTaken,
+  resolveIdentity
 };
