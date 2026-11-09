@@ -623,11 +623,753 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ----------------------------------------------------------------------
-   * FEAT-003 implementara o motor de turnos (rollDice, buyDecision, build,
-   * mortgage, trade, jail, etc.). Nada aqui lanca (throw) -- o servidor
-   * continua funcionando e o lobby esta completo apos FEAT-002.
-   * ---------------------------------------------------------------------- */
+  /* ======================================================================
+   * FEAT-003 – Motor de turnos server-authoritative
+   * ====================================================================== */
+
+  // Helpers internos ---------------------------------------------------
+
+  function getRoom(socketId) {
+    const reg = socketToRoom.get(socketId);
+    if (!reg) return null;
+    const room = rooms.get(reg.roomId);
+    if (!room) return null;
+    return { room, reg };
+  }
+
+  function getGameAndPlayer(socketId) {
+    const res = getRoom(socketId);
+    if (!res) return null;
+    const gs = games.get(res.reg.roomId);
+    if (!gs) return null;
+    const gp = gs.players.find((p) => p.id === res.reg.playerId);
+    if (!gp) return null;
+    return { room: res.room, gs, gp, reg: res.reg };
+  }
+
+  function isCurrentPlayer(gs, playerId) {
+    return gs.players[gs.currentPlayerIndex] &&
+           gs.players[gs.currentPlayerIndex].id === playerId;
+  }
+
+  // Calcula o aluguel devido por uma casa de transporte com base em quantos
+  // transportes o dono possui.
+  function calcTransportRent(gs, ownerGp, spaceData) {
+    let count = 0;
+    for (const idx of TRANSPORT_GROUP) {
+      if (ownerGp.properties[idx] && !ownerGp.properties[idx].mortgaged) count++;
+    }
+    return spaceData.diceMult * count;
+  }
+
+  // Verifica se o jogador tem o grupo de cor completo (sem hipotecas para
+  // efeitos de dobragem: apenas verifica posse, hipotecas influem no rent).
+  function ownsColorGroup(gs, gp, color) {
+    const group = COLOR_GROUPS[color];
+    if (!group) return false;
+    for (const idx of group) {
+      const prop = gp.properties[idx];
+      if (!prop) return false;
+    }
+    return true;
+  }
+
+  // Calcula o aluguel de um imovel (propriedade).
+  function calcPropertyRent(gs, ownerGp, spaceIndex) {
+    const space = BOARD_SPACES[spaceIndex];
+    if (!space || space.type !== 'property') return 0;
+    const prop = ownerGp.properties[spaceIndex];
+    if (!prop || prop.mortgaged) return 0;
+    if (prop.hotel) return space.rent[5];
+    if (prop.houses > 0) return space.rent[prop.houses];
+    // Sem casas: verifica dobragem (dono tem o grupo inteiro, sem hipotecas).
+    const allOwned = ownsColorGroup(gs, ownerGp, space.color);
+    if (allOwned) return space.rent[0] * 2;
+    return space.rent[0];
+  }
+
+  // Transfere dinheiro de payer para payee (ou bank se payee nulo).
+  // Retorna verdadeiro se payer ficou insolvente (exige resolucao de falencia).
+  function transfer(gs, payerId, payeeId, amount) {
+    const payer = gs.players.find((p) => p.id === payerId);
+    if (!payer) return false;
+    payer.balance -= amount;
+    if (payeeId) {
+      const payee = gs.players.find((p) => p.id === payeeId);
+      if (payee) payee.balance += amount;
+    }
+    return payer.balance < 0;
+  }
+
+  // Loga mensagem no estado do jogo.
+  function logMsg(gs, msg) {
+    gs.log = gs.log || [];
+    gs.log.push(msg);
+    if (gs.log.length > 60) gs.log.shift();
+  }
+
+  // Manda o jogador para a delegacia.
+  function sendToJail(gs, gpIndex) {
+    const gp = gs.players[gpIndex];
+    gp.inJail = true;
+    gp.jailTurns = 0;
+    gp.position = 10;
+    logMsg(gs, `${gp.nickname} foi para a Delegacia.`);
+  }
+
+  // Avanca o peao e retorna { newPos, passedGo }.
+  function advancePawn(gp, steps) {
+    const old = gp.position;
+    const newPos = (old + steps) % 40;
+    const passedGo = newPos < old || steps === 0 && old === 0;
+    gp.position = newPos;
+    return { newPos, passedGo: newPos <= old && steps > 0 };
+  }
+
+  // Move para uma posicao absoluta, pagando GO se necessario.
+  function moveTo(gs, gpIndex, target, collectGo) {
+    const gp = gs.players[gpIndex];
+    const old = gp.position;
+    gp.position = target;
+    const passedGo = target < old || (old === 0 && target === 0);
+    if (collectGo && passedGo && target !== 0) {
+      gp.balance += 200;
+      logMsg(gs, `${gp.nickname} passou pelo Início e recebeu R$200k.`);
+    }
+  }
+
+  // Aplica efeito de carta de Acaso.
+  function applyChanceCard(gs, gpIndex, card) {
+    const gp = gs.players[gpIndex];
+    const roomPlayers = gs.players;
+    switch (card.kind) {
+      case 'getOutJailFree':
+        gp.getOutJailFreeCards++;
+        logMsg(gs, `${gp.nickname} recebeu uma carta Habeas Corpus.`);
+        break;
+      case 'advanceToGo':
+        gp.position = 0;
+        gp.balance += 200;
+        logMsg(gs, `${gp.nickname} avancou para o Início e recebeu R$200k.`);
+        break;
+      case 'moveToJail':
+        sendToJail(gs, gpIndex);
+        break;
+      case 'moveTo': {
+        const old = gp.position;
+        gp.position = card.target;
+        const passed = card.target < old;
+        if (passed) {
+          gp.balance += 200;
+          logMsg(gs, `${gp.nickname} passou pelo Início e recebeu R$200k.`);
+        }
+        logMsg(gs, `${gp.nickname} moveu para ${BOARD_SPACES[card.target].name}.`);
+        break;
+      }
+      case 'goBack':
+        gp.position = (gp.position - card.spaces + 40) % 40;
+        logMsg(gs, `${gp.nickname} voltou ${card.spaces} casas.`);
+        break;
+      case 'gain':
+        gp.balance += card.amount;
+        logMsg(gs, `${gp.nickname} recebeu R$${card.amount}k.`);
+        break;
+      case 'pay':
+        gp.balance -= card.amount;
+        logMsg(gs, `${gp.nickname} pagou R$${card.amount}k.`);
+        break;
+      case 'gainFromEach':
+        for (const other of roomPlayers) {
+          if (other.id !== gp.id && !other.bankrupt) {
+            other.balance -= card.amount;
+            gp.balance += card.amount;
+          }
+        }
+        logMsg(gs, `${gp.nickname} recebeu R$${card.amount}k de cada jogador.`);
+        break;
+      case 'payRepair': {
+        let total = 0;
+        for (const [idx, prop] of Object.entries(gp.properties)) {
+          if (prop.hotel) total += card.perHotel;
+          else total += (prop.houses || 0) * card.perHouse;
+        }
+        gp.balance -= total;
+        logMsg(gs, `${gp.nickname} pagou R$${total}k em reparos.`);
+        break;
+      }
+    }
+  }
+
+  // Determina o efeito da casa em que o jogador parou.
+  // Retorna { phase, pendingDecision } para ser aplicado ao gs.
+  function resolveSpace(gs, gpIndex, io) {
+    const gp = gs.players[gpIndex];
+    const space = BOARD_SPACES[gp.position];
+    const roomId = gs._roomId;
+
+    switch (space.type) {
+      case 'go':
+        logMsg(gs, `${gp.nickname} parou no Início da Jornada.`);
+        break;
+
+      case 'jail':
+        logMsg(gs, `${gp.nickname} está visitando a Delegacia.`);
+        break;
+
+      case 'freeparking':
+        logMsg(gs, `${gp.nickname} parou no Estacionamento Livre.`);
+        break;
+
+      case 'gotojail':
+        sendToJail(gs, gpIndex);
+        break;
+
+      case 'tax': {
+        const amt = space.amount || 200;
+        gp.balance -= amt;
+        logMsg(gs, `${gp.nickname} pagou R$${amt}k de imposto.`);
+        break;
+      }
+
+      case 'bonus': {
+        const amt = space.amount || 200;
+        gp.balance += amt;
+        logMsg(gs, `${gp.nickname} recebeu R$${amt}k de bônus.`);
+        break;
+      }
+
+      case 'chance': {
+        if (gs.chanceDeck.length === 0) gs.chanceDeck = shuffle(CHANCE_CARDS);
+        const card = gs.chanceDeck.shift();
+        gs.chanceDeck.push(card); // baralho circular
+        applyChanceCard(gs, gpIndex, card);
+        gs.lastCard = card;
+        logMsg(gs, `Acaso: "${card.text}"`);
+        // Apos carta, pode ter movido o pawn; resolve o novo espaco se nao for jail/go
+        if (card.kind === 'moveTo' || card.kind === 'goBack') {
+          // Resolve o novo espaco recursivamente (mas sem chain de acaso)
+          const newSpace = BOARD_SPACES[gp.position];
+          if (newSpace.type === 'property' || newSpace.type === 'transport') {
+            return resolveSpace(gs, gpIndex, io);
+          }
+        }
+        break;
+      }
+
+      case 'property':
+      case 'transport': {
+        // Verifica se alguem e dono desta casa.
+        let ownerGp = null;
+        for (const p of gs.players) {
+          if (p.properties[gp.position] !== undefined) { ownerGp = p; break; }
+        }
+        if (!ownerGp) {
+          // Ninguem possui: oferecer compra ao jogador atual.
+          return {
+            phase: TURN_PHASE.WAITING_BUY_DECISION,
+            pendingDecision: { type: 'buy', spaceIndex: gp.position }
+          };
+        }
+        if (ownerGp.id === gp.id) {
+          // Propria propriedade: nada.
+          logMsg(gs, `${gp.nickname} parou em sua própria propriedade.`);
+          break;
+        }
+        if (ownerGp.properties[gp.position].mortgaged) {
+          logMsg(gs, `${gp.nickname} parou em imóvel hipotecado.`);
+          break;
+        }
+        // Calcular aluguel.
+        let rent = 0;
+        if (space.type === 'transport') {
+          rent = calcTransportRent(gs, ownerGp, space);
+        } else {
+          rent = calcPropertyRent(gs, ownerGp, gp.position);
+        }
+        transfer(gs, gp.id, ownerGp.id, rent);
+        logMsg(gs, `${gp.nickname} pagou R$${rent}k de aluguel a ${ownerGp.nickname}.`);
+        break;
+      }
+    }
+
+    return { phase: TURN_PHASE.TURN_ACTIONS, pendingDecision: null };
+  }
+
+  // Checa se o jogador esta falido (balanco negativo sem ativos para liquidar).
+  function checkBankruptcy(gs, gpIndex) {
+    const gp = gs.players[gpIndex];
+    if (gp.balance >= 0) return false;
+    // Ainda tem propriedades? Deixa o jogador resolver.
+    const hasProps = Object.keys(gp.properties).length > 0;
+    if (hasProps) return false; // sera resolvido via BANKRUPTCY_RESOLUTION
+    return true;
+  }
+
+  // Declara falencia: remove propriedades e marca bankrupt.
+  function declareBankruptcy(gs, gpIndex) {
+    const gp = gs.players[gpIndex];
+    gp.bankrupt = true;
+    gp.balance = 0;
+    gp.properties = {};
+    logMsg(gs, `${gp.nickname} declarou falência!`);
+  }
+
+  // Avanca para o proximo turno (pula falidos, verifica fim de jogo).
+  // Retorna true se o jogo acabou.
+  function advanceTurn(gs, rolledDoubles) {
+    const current = gs.players[gs.currentPlayerIndex];
+    // Dobradinha: o mesmo jogador joga novamente (exceto se foi preso).
+    if (rolledDoubles && !current.inJail) {
+      gs.doublesCount = (gs.doublesCount || 0) + 1;
+      gs.turnPhase = TURN_PHASE.WAITING_ROLL;
+      gs.pendingDecision = null;
+      logMsg(gs, `${current.nickname} tirou dobradinha! Joga novamente.`);
+      return false;
+    }
+    gs.doublesCount = 0;
+    // Proximo jogador nao falido.
+    let next = (gs.currentPlayerIndex + 1) % gs.players.length;
+    let loops = 0;
+    while (gs.players[next].bankrupt && loops < gs.players.length) {
+      next = (next + 1) % gs.players.length;
+      loops++;
+    }
+    // Verifica se o jogo terminou (apenas 1 jogador ativo).
+    const activePlayers = gs.players.filter((p) => !p.bankrupt);
+    if (activePlayers.length <= 1) {
+      gs.gameOver = true;
+      gs.winnerId = activePlayers.length === 1 ? activePlayers[0].id : null;
+      logMsg(gs, activePlayers.length === 1
+        ? `${activePlayers[0].nickname} venceu a partida!`
+        : 'Partida encerrada.');
+      return true;
+    }
+    gs.currentPlayerIndex = next;
+    gs.turnPhase = TURN_PHASE.WAITING_ROLL;
+    gs.pendingDecision = null;
+    gs.lastRoll = null;
+    return false;
+  }
+
+  // Broadcast do estado completo para a sala.
+  function broadcastGameState(roomId) {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    io.to(roomId).emit('gameState', sanitizeRoomState(room));
+  }
+
+  /* -----------------------------------------------------------------------
+   * rollDice
+   * ----------------------------------------------------------------------- */
+  socket.on('rollDice', () => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp, reg } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
+    if (gs.turnPhase !== TURN_PHASE.WAITING_ROLL) {
+      socket.emit('error', { message: 'Não é o momento de rolar.' }); return;
+    }
+    if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
+
+    const d1 = Math.floor(Math.random() * 6) + 1;
+    const d2 = Math.floor(Math.random() * 6) + 1;
+    const doubles = d1 === d2;
+    gs.dice = [d1, d2];
+    gs.lastRoll = { d1, d2 };
+
+    // Logica de prisao
+    if (gp.inJail) {
+      gs.doublesCount = 0;
+      if (doubles) {
+        gp.inJail = false;
+        gp.jailTurns = 0;
+        logMsg(gs, `${gp.nickname} tirou dobradinha e saiu da Delegacia!`);
+      } else {
+        gp.jailTurns = (gp.jailTurns || 0) + 1;
+        if (gp.jailTurns >= 3) {
+          gp.balance -= 50;
+          gp.inJail = false;
+          gp.jailTurns = 0;
+          logMsg(gs, `${gp.nickname} pagou a fiança R$50k após 3 turnos.`);
+        } else {
+          logMsg(gs, `${gp.nickname} não conseguiu sair da Delegacia (tentativa ${gp.jailTurns}/3).`);
+          gs.turnPhase = TURN_PHASE.TURN_ACTIONS;
+          gs._lastDoubles = false;
+          broadcastGameState(room.id);
+          return;
+        }
+      }
+    } else if (doubles) {
+      gs.doublesCount = (gs.doublesCount || 0) + 1;
+      if (gs.doublesCount >= 3) {
+        sendToJail(gs, gs.currentPlayerIndex);
+        gs.doublesCount = 0;
+        gs.turnPhase = TURN_PHASE.TURN_ACTIONS;
+        gs._lastDoubles = false;
+        broadcastGameState(room.id);
+        return;
+      }
+    }
+
+    // Mover pawn
+    const steps = d1 + d2;
+    const oldPos = gp.position;
+    const newPos = (oldPos + steps) % 40;
+    const passedGo = newPos < oldPos;
+    gp.position = newPos;
+    if (passedGo) {
+      gp.balance += 200;
+      logMsg(gs, `${gp.nickname} passou pelo Início e recebeu R$200k.`);
+    }
+    logMsg(gs, `${gp.nickname} rolou ${d1}+${d2}=${steps} e foi para ${BOARD_SPACES[newPos].name}.`);
+
+    // Armazenar para uso em advanceTurn
+    gs._lastDoubles = doubles;
+
+    // Guardar roomId no gs para uso interno (resolvidos localmente)
+    gs._roomId = room.id;
+
+    // Resolver a casa
+    const result = resolveSpace(gs, gs.currentPlayerIndex, io);
+    gs.turnPhase = result.phase;
+    gs.pendingDecision = result.pendingDecision;
+
+    // Verificar falencia apos pagamento de aluguel/taxa
+    if (gs.turnPhase === TURN_PHASE.TURN_ACTIONS && gp.balance < 0) {
+      if (!Object.keys(gp.properties).length) {
+        declareBankruptcy(gs, gs.currentPlayerIndex);
+        advanceTurn(gs, false);
+      } else {
+        gs.turnPhase = TURN_PHASE.BANKRUPTCY_RESOLUTION;
+        gs.pendingDecision = { type: 'bankrupt', playerId: gp.id };
+        logMsg(gs, `${gp.nickname} está insolvente e precisa liquidar bens.`);
+      }
+    }
+
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * buyDecision – comprar ou passar
+   * ----------------------------------------------------------------------- */
+  socket.on('buyDecision', (payload) => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
+    if (gs.turnPhase !== TURN_PHASE.WAITING_BUY_DECISION) {
+      socket.emit('error', { message: 'Não há decisão de compra pendente.' }); return;
+    }
+    const dec = gs.pendingDecision;
+    if (!dec || dec.type !== 'buy') {
+      socket.emit('error', { message: 'Decisão inválida.' }); return;
+    }
+    const spaceIndex = dec.spaceIndex;
+    const space = BOARD_SPACES[spaceIndex];
+    const buy = payload && payload.buy === true;
+    if (buy) {
+      if (gp.balance < space.price) {
+        socket.emit('error', { message: 'Saldo insuficiente.' }); return;
+      }
+      gp.balance -= space.price;
+      gp.properties[spaceIndex] = { houses: 0, hotel: false, mortgaged: false };
+      logMsg(gs, `${gp.nickname} comprou ${space.name} por R$${space.price}k.`);
+    } else {
+      logMsg(gs, `${gp.nickname} optou por não comprar ${space.name}.`);
+    }
+    gs.turnPhase = TURN_PHASE.TURN_ACTIONS;
+    gs.pendingDecision = null;
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * endTurn – jogador encerra o turno manualmente
+   * ----------------------------------------------------------------------- */
+  socket.on('endTurn', () => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
+    if (gs.turnPhase !== TURN_PHASE.TURN_ACTIONS) {
+      socket.emit('error', { message: 'Não é possível encerrar o turno agora.' }); return;
+    }
+    if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
+    const doubles = gs._lastDoubles || false;
+    gs._lastDoubles = false;
+    const over = advanceTurn(gs, doubles);
+    if (over) {
+      io.to(room.id).emit('gameOver', { winnerId: gs.winnerId, log: gs.log });
+    }
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * jailAction – pagar fianca, usar carta, tentar dobradinha
+   * payload.action: 'pay' | 'card' | 'roll'
+   * ----------------------------------------------------------------------- */
+  socket.on('jailAction', (payload) => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
+    if (!gp.inJail) {
+      socket.emit('error', { message: 'Você não está na Delegacia.' }); return;
+    }
+    const action = payload && payload.action;
+    if (action === 'pay') {
+      if (gp.balance < 50) { socket.emit('error', { message: 'Saldo insuficiente.' }); return; }
+      gp.balance -= 50;
+      gp.inJail = false;
+      gp.jailTurns = 0;
+      logMsg(gs, `${gp.nickname} pagou fiança R$50k e saiu da Delegacia.`);
+      gs.turnPhase = TURN_PHASE.WAITING_ROLL;
+    } else if (action === 'card') {
+      if (gp.getOutJailFreeCards < 1) {
+        socket.emit('error', { message: 'Você não tem carta Habeas Corpus.' }); return;
+      }
+      gp.getOutJailFreeCards--;
+      gp.inJail = false;
+      gp.jailTurns = 0;
+      logMsg(gs, `${gp.nickname} usou carta Habeas Corpus e saiu da Delegacia.`);
+      gs.turnPhase = TURN_PHASE.WAITING_ROLL;
+    } else if (action === 'roll') {
+      // Apenas registra intenção; o rollDice vai resolver o resto
+      gs.turnPhase = TURN_PHASE.WAITING_ROLL;
+      logMsg(gs, `${gp.nickname} vai tentar tirar dobradinha para sair.`);
+    } else {
+      socket.emit('error', { message: 'Ação de delegacia inválida.' }); return;
+    }
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * build – construir casa/hotel em uma propriedade
+   * payload: { spaceIndex, action: 'build' | 'sell' }
+   * ----------------------------------------------------------------------- */
+  socket.on('build', (payload) => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
+    const spaceIndex = payload && parseInt(payload.spaceIndex, 10);
+    const action = payload && payload.action;
+    const prop = gp.properties[spaceIndex];
+    if (!prop) { socket.emit('error', { message: 'Você não possui este imóvel.' }); return; }
+    if (prop.mortgaged) { socket.emit('error', { message: 'Imóvel hipotecado.' }); return; }
+    const space = BOARD_SPACES[spaceIndex];
+    if (space.type !== 'property') { socket.emit('error', { message: 'Só imóveis suportam construção.' }); return; }
+    if (!ownsColorGroup(gs, gp, space.color)) {
+      socket.emit('error', { message: 'Você precisa ter todo o grupo de cor.' }); return;
+    }
+
+    if (action === 'build') {
+      if (prop.hotel) { socket.emit('error', { message: 'Já tem hotel.' }); return; }
+      if (prop.houses >= 4) {
+        // Upgrade para hotel
+        if (gp.balance < space.houseCost) { socket.emit('error', { message: 'Saldo insuficiente.' }); return; }
+        gp.balance -= space.houseCost;
+        prop.houses = 0;
+        prop.hotel = true;
+        logMsg(gs, `${gp.nickname} construiu um hotel em ${space.name}.`);
+      } else {
+        if (gp.balance < space.houseCost) { socket.emit('error', { message: 'Saldo insuficiente.' }); return; }
+        gp.balance -= space.houseCost;
+        prop.houses++;
+        logMsg(gs, `${gp.nickname} construiu casa #${prop.houses} em ${space.name}.`);
+      }
+    } else if (action === 'sell') {
+      if (prop.hotel) {
+        gp.balance += Math.floor(space.houseCost / 2);
+        prop.hotel = false;
+        prop.houses = 4;
+        logMsg(gs, `${gp.nickname} vendeu o hotel de ${space.name}.`);
+      } else if (prop.houses > 0) {
+        gp.balance += Math.floor(space.houseCost / 2);
+        prop.houses--;
+        logMsg(gs, `${gp.nickname} vendeu uma casa em ${space.name}.`);
+      } else {
+        socket.emit('error', { message: 'Sem construções para vender.' }); return;
+      }
+    } else {
+      socket.emit('error', { message: 'Ação de construção inválida.' }); return;
+    }
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * mortgage – hipotecar ou quitar hipoteca
+   * payload: { spaceIndex, action: 'mortgage' | 'unmortgage' }
+   * ----------------------------------------------------------------------- */
+  socket.on('mortgage', (payload) => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
+    const spaceIndex = payload && parseInt(payload.spaceIndex, 10);
+    const action = payload && payload.action;
+    const prop = gp.properties[spaceIndex];
+    if (!prop) { socket.emit('error', { message: 'Você não possui este imóvel.' }); return; }
+    const space = BOARD_SPACES[spaceIndex];
+
+    if (action === 'mortgage') {
+      if (prop.mortgaged) { socket.emit('error', { message: 'Já hipotecado.' }); return; }
+      if (prop.hotel || prop.houses > 0) {
+        socket.emit('error', { message: 'Venda as construções primeiro.' }); return;
+      }
+      gp.balance += space.mortgage;
+      prop.mortgaged = true;
+      logMsg(gs, `${gp.nickname} hipotecou ${space.name} por R$${space.mortgage}k.`);
+    } else if (action === 'unmortgage') {
+      if (!prop.mortgaged) { socket.emit('error', { message: 'Imóvel não está hipotecado.' }); return; }
+      const cost = Math.floor(space.mortgage * 1.1);
+      if (gp.balance < cost) { socket.emit('error', { message: 'Saldo insuficiente.' }); return; }
+      gp.balance -= cost;
+      prop.mortgaged = false;
+      logMsg(gs, `${gp.nickname} quitou hipoteca de ${space.name} por R$${cost}k.`);
+    } else {
+      socket.emit('error', { message: 'Ação de hipoteca inválida.' }); return;
+    }
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * proposeTrade – jogador propoe negociacao
+   * payload: { targetPlayerId, offerProps: [idx], offerMoney, requestProps: [idx], requestMoney }
+   * ----------------------------------------------------------------------- */
+  socket.on('proposeTrade', (payload) => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
+    const p = payload || {};
+    const target = gs.players.find((x) => x.id === p.targetPlayerId && !x.bankrupt);
+    if (!target || target.id === gp.id) {
+      socket.emit('error', { message: 'Alvo de negociação inválido.' }); return;
+    }
+    const offerProps = Array.isArray(p.offerProps) ? p.offerProps.map(Number) : [];
+    const requestProps = Array.isArray(p.requestProps) ? p.requestProps.map(Number) : [];
+    const offerMoney = Math.max(0, parseInt(p.offerMoney, 10) || 0);
+    const requestMoney = Math.max(0, parseInt(p.requestMoney, 10) || 0);
+
+    // Validar que o proponente possui os imoveis oferecidos.
+    for (const idx of offerProps) {
+      if (!gp.properties[idx]) {
+        socket.emit('error', { message: `Você não possui o imóvel #${idx}.` }); return;
+      }
+    }
+    // Validar que o alvo possui os imoveis pedidos.
+    for (const idx of requestProps) {
+      if (!target.properties[idx]) {
+        socket.emit('error', { message: `${target.nickname} não possui o imóvel #${idx}.` }); return;
+      }
+    }
+    // Saldo suficiente para o dinheiro oferecido.
+    if (offerMoney > 0 && gp.balance < offerMoney) {
+      socket.emit('error', { message: 'Saldo insuficiente para o valor oferecido.' }); return;
+    }
+
+    const tradeId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    gs.pendingTrade = { tradeId, fromId: gp.id, toId: target.id, offerProps, offerMoney, requestProps, requestMoney };
+
+    // Notifica o alvo.
+    const targetPlayer = room.players.get(target.id);
+    if (targetPlayer && targetPlayer.socketId) {
+      // Busca o socket diretamente no io.connected (compatível com socket.io real e fake)
+      let targetSocket = null;
+      for (const s of io.connected || []) {
+        if ((s.id || '') === targetPlayer.socketId) { targetSocket = s; break; }
+      }
+      // Fallback: io.to() (funciona no socket.io real com salas de socket)
+      const emitTarget = targetSocket || io.to(targetPlayer.socketId);
+      emitTarget.emit('tradeProposal', {
+        tradeId,
+        from: gp.nickname,
+        offerProps: offerProps.map((i) => ({ index: i, name: BOARD_SPACES[i].name })),
+        offerMoney,
+        requestProps: requestProps.map((i) => ({ index: i, name: BOARD_SPACES[i].name })),
+        requestMoney
+      });
+    }
+    logMsg(gs, `${gp.nickname} propôs negociação a ${target.nickname}.`);
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * respondTrade – alvo aceita ou recusa
+   * payload: { tradeId, accept: bool }
+   * ----------------------------------------------------------------------- */
+  socket.on('respondTrade', (payload) => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    const p = payload || {};
+    const trade = gs.pendingTrade;
+    if (!trade || trade.tradeId !== p.tradeId || trade.toId !== gp.id) {
+      socket.emit('error', { message: 'Negociação não encontrada ou inválida.' }); return;
+    }
+    gs.pendingTrade = null;
+
+    if (!p.accept) {
+      logMsg(gs, `${gp.nickname} recusou a proposta de negociação.`);
+      broadcastGameState(room.id);
+      return;
+    }
+
+    const from = gs.players.find((x) => x.id === trade.fromId);
+    const to = gp;
+
+    // Transferir propriedades do proponente para o alvo.
+    for (const idx of trade.offerProps) {
+      if (!from.properties[idx]) continue;
+      to.properties[idx] = from.properties[idx];
+      delete from.properties[idx];
+    }
+    // Transferir propriedades do alvo para o proponente.
+    for (const idx of trade.requestProps) {
+      if (!to.properties[idx]) continue;
+      from.properties[idx] = to.properties[idx];
+      delete to.properties[idx];
+    }
+    // Transferir dinheiro.
+    if (trade.offerMoney > 0) {
+      from.balance -= trade.offerMoney;
+      to.balance += trade.offerMoney;
+    }
+    if (trade.requestMoney > 0) {
+      to.balance -= trade.requestMoney;
+      from.balance += trade.requestMoney;
+    }
+    logMsg(gs, `${from.nickname} e ${to.nickname} concluíram uma negociação.`);
+    broadcastGameState(room.id);
+  });
+
+  /* -----------------------------------------------------------------------
+   * declareBankrupt – jogador se declara falido voluntariamente
+   * ----------------------------------------------------------------------- */
+  socket.on('declareBankrupt', () => {
+    const ctx = getGameAndPlayer(socket.id);
+    if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
+    const { room, gs, gp } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
+    const gpIndex = gs.players.indexOf(gp);
+    declareBankruptcy(gs, gpIndex);
+    const over = advanceTurn(gs, false);
+    if (over) {
+      io.to(room.id).emit('gameOver', { winnerId: gs.winnerId, log: gs.log });
+    }
+    broadcastGameState(room.id);
+  });
+
 });
 
 const PORT = process.env.PORT || 3000;

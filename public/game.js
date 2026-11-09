@@ -1,0 +1,1547 @@
+/**
+ * Magnata Brasil – Lógica do cliente + Game Feel (FEAT-005 + VFX)
+ * ---------------------------------------------------------------
+ * Mantém TODOS os nomes de eventos Socket.io intactos:
+ *   rollDice, buyDecision, jailAction, build, mortgage,
+ *   proposeTrade, respondTrade, declareBankrupt, endTurn
+ *
+ * Adições de Game Feel:
+ *  - SoundEffects  : Web Audio API (sem MP3 externos), mute global
+ *  - Partículas    : Canvas confetti nativo (sem CDN externo)
+ *  - Screen shake  : tremida CSS quando pagar aluguel alto ou ir preso
+ *  - Peão step     : animação casa-a-casa (160ms/passo)
+ *  - Dados 3D      : animação de rolagem no eixo XYZ, destaque dobradinha
+ *  - Card flip     : modal de escritura e carta Acaso com flip 3D
+ */
+'use strict';
+
+(function () {
+  /* =========================================================================
+   * Constantes locais
+   * ========================================================================= */
+  const TURN_PHASE = {
+    WAITING_ROLL: 'WAITING_ROLL',
+    ANIMATING_MOVE: 'ANIMATING_MOVE',
+    WAITING_BUY_DECISION: 'WAITING_BUY_DECISION',
+    TURN_ACTIONS: 'TURN_ACTIONS',
+    BANKRUPTCY_RESOLUTION: 'BANKRUPTCY_RESOLUTION'
+  };
+
+  const COLOR_CSS = {
+    'Rosa':        '#e93d8a',
+    'Azul Claro':  '#38bdf8',
+    'Roxo':        '#8b5cf6',
+    'Laranja':     '#f97316',
+    'Vermelho':    '#ef4444',
+    'Amarelo':     '#facc15',
+    'Verde':       '#22c55e',
+    'Azul Escuro': '#1d4ed8'
+  };
+
+  const PLAYER_COLOR_CSS = {
+    'Vermelho': '#dc2626',
+    'Azul':     '#2563eb',
+    'Verde':    '#16a34a',
+    'Amarelo':  '#eab308',
+    'Roxo':     '#7c3aed',
+    'Laranja':  '#ea580c'
+  };
+
+  /* =========================================================================
+   * Estado local
+   * ========================================================================= */
+  let mySessionId       = null;
+  let myPlayerId        = null;
+  let myRoomId          = null;
+  let myNickname        = '';
+  let pendingJoinRoomId = null;
+  let lastGameState     = null;
+  // Posições anteriores dos peões para calcular a rota de animação
+  let prevPositions     = {};
+  // Flag: estamos animando uma movimentação (bloqueia render instantâneo de pawns)
+  let animatingPawn     = false;
+  // Decisão de compra pendente para mostrar após animação terminar
+  let pendingBuyAfterAnim = null;
+
+  /* =========================================================================
+   * Socket
+   * ========================================================================= */
+  const socket = window.socket || (typeof io === 'function' ? io() : null);
+  if (!socket) { console.error('[MB] Socket.io não disponível.'); return; }
+
+  /* =========================================================================
+   * ===  SOUND EFFECTS – Web Audio API nativa (zero dependências externas) ===
+   * ========================================================================= */
+  const SoundEffects = (function () {
+    let ctx = null;
+    let muted = false;
+
+    function getCtx() {
+      if (!ctx) {
+        try { ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+      }
+      // Resume se suspenso (autoplay policy)
+      if (ctx && ctx.state === 'suspended') ctx.resume();
+      return ctx;
+    }
+
+    // Gera envelope ADSR simples
+    function envelope(gainNode, ac, attack, decay, sustain, release, startTime) {
+      gainNode.gain.setValueAtTime(0, startTime);
+      gainNode.gain.linearRampToValueAtTime(0.7, startTime + attack);
+      gainNode.gain.linearRampToValueAtTime(sustain, startTime + attack + decay);
+      gainNode.gain.setValueAtTime(sustain, startTime + attack + decay + 0.01);
+      gainNode.gain.linearRampToValueAtTime(0, startTime + attack + decay + release);
+    }
+
+    function tone(freq, type, startTime, duration, vol) {
+      const ac = getCtx();
+      if (!ac || muted) return;
+      const osc = ac.createOscillator();
+      const g = ac.createGain();
+      osc.type = type || 'sine';
+      osc.frequency.setValueAtTime(freq, startTime);
+      g.gain.setValueAtTime(vol || 0.3, startTime);
+      g.gain.linearRampToValueAtTime(0, startTime + duration);
+      osc.connect(g);
+      g.connect(ac.destination);
+      osc.start(startTime);
+      osc.stop(startTime + duration + 0.01);
+    }
+
+    function noise(startTime, duration, vol) {
+      const ac = getCtx();
+      if (!ac || muted) return;
+      const bufSz = ac.sampleRate * duration;
+      const buf = ac.createBuffer(1, bufSz, ac.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bufSz; i++) data[i] = Math.random() * 2 - 1;
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      const g = ac.createGain();
+      g.gain.setValueAtTime(vol || 0.15, startTime);
+      g.gain.linearRampToValueAtTime(0, startTime + duration);
+      src.connect(g);
+      g.connect(ac.destination);
+      src.start(startTime);
+    }
+
+    return {
+      setMute(v) { muted = !!v; },
+      getMute() { return muted; },
+
+      // Dados rolando: ruído breve + tremor
+      diceRoll() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        noise(t, 0.08, 0.25);
+        noise(t + 0.12, 0.08, 0.2);
+        noise(t + 0.22, 0.08, 0.15);
+        tone(180, 'sawtooth', t + 0.28, 0.05, 0.1);
+        tone(160, 'sawtooth', t + 0.34, 0.05, 0.08);
+      },
+
+      // Pop por casa (escala musical dó-maior, nota indexada por posição)
+      stepPop(step) {
+        const ac = getCtx(); if (!ac || muted) return;
+        const scale = [261.63, 293.66, 329.63, 349.23, 392, 440, 493.88, 523.25];
+        const freq = scale[step % scale.length];
+        const t = ac.currentTime;
+        tone(freq, 'triangle', t, 0.06, 0.2);
+        tone(freq * 2, 'sine', t, 0.04, 0.08);
+      },
+
+      // Caixa registradora "Cha-Ching" ao receber dinheiro
+      cashRegister() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        tone(1046, 'sine', t, 0.06, 0.35);
+        tone(1318, 'sine', t + 0.07, 0.06, 0.35);
+        tone(1568, 'sine', t + 0.14, 0.10, 0.4);
+        tone(2093, 'sine', t + 0.22, 0.12, 0.5);
+      },
+
+      // Perda de dinheiro – tom descendente
+      cashLoss() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        tone(392, 'sawtooth', t, 0.05, 0.25);
+        tone(349, 'sawtooth', t + 0.06, 0.05, 0.2);
+        tone(294, 'sawtooth', t + 0.12, 0.08, 0.15);
+      },
+
+      // Construção de casa – marteladas crescentes
+      buildHouse() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        noise(t, 0.05, 0.3);
+        noise(t + 0.07, 0.05, 0.3);
+        tone(880, 'square', t + 0.14, 0.08, 0.2);
+        tone(1046, 'square', t + 0.23, 0.1, 0.25);
+      },
+
+      // Hotel – fanfarra breve
+      buildHotel() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        [523, 659, 784, 1046].forEach((f, i) => tone(f, 'square', t + i * 0.07, 0.12, 0.3));
+      },
+
+      // Sirene: ir para a Delegacia
+      goToJail() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        for (let i = 0; i < 6; i++) {
+          tone(880 + (i % 2) * 220, 'sawtooth', t + i * 0.07, 0.065, 0.35);
+        }
+      },
+
+      // Fanfarra de vitória
+      victory() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        [523, 659, 784, 1046, 1318].forEach((f, i) =>
+          tone(f, 'square', t + i * 0.09, 0.16, 0.35 + i * 0.03));
+      },
+
+      // Carta de Acaso virada
+      cardFlip() {
+        const ac = getCtx(); if (!ac || muted) return;
+        const t = ac.currentTime;
+        tone(440, 'sine', t, 0.04, 0.2);
+        tone(880, 'sine', t + 0.05, 0.04, 0.15);
+      }
+    };
+  })();
+
+  /* =========================================================================
+   * ===  CONFETTI – Canvas nativo, zero CDN  ===
+   * ========================================================================= */
+  const Confetti = (function () {
+    let canvas = null;
+    let ctx2d = null;
+    let particles = [];
+    let rafId = null;
+
+    function ensure() {
+      if (canvas) return;
+      canvas = document.createElement('canvas');
+      canvas.style.cssText =
+        'position:fixed;inset:0;pointer-events:none;z-index:9999;width:100%;height:100%;';
+      document.body.appendChild(canvas);
+      ctx2d = canvas.getContext('2d');
+    }
+
+    function resize() {
+      if (!canvas) return;
+      canvas.width  = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+
+    window.addEventListener('resize', () => { if (canvas) resize(); });
+
+    function spawn(count, originX, originY) {
+      ensure();
+      resize();
+      const colors = ['#facc15','#f97316','#22c55e','#38bdf8','#e93d8a','#8b5cf6','#ef4444','#fff'];
+      for (let i = 0; i < count; i++) {
+        const angle = (Math.random() * 360) * Math.PI / 180;
+        const speed = 4 + Math.random() * 8;
+        particles.push({
+          x: originX || canvas.width / 2,
+          y: originY || canvas.height / 3,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed - 6,
+          color: colors[Math.floor(Math.random() * colors.length)],
+          w: 6 + Math.random() * 8,
+          h: 4 + Math.random() * 6,
+          rot: Math.random() * 360,
+          rotV: (Math.random() - 0.5) * 8,
+          life: 1
+        });
+      }
+      if (!rafId) loop();
+    }
+
+    function loop() {
+      if (!ctx2d) return;
+      ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x  += p.vx;
+        p.y  += p.vy;
+        p.vy += 0.3;
+        p.vx *= 0.99;
+        p.rot += p.rotV;
+        p.life -= 0.012;
+        if (p.life <= 0 || p.y > canvas.height + 40) {
+          particles.splice(i, 1);
+          continue;
+        }
+        ctx2d.save();
+        ctx2d.globalAlpha = Math.min(1, p.life * 2);
+        ctx2d.translate(p.x, p.y);
+        ctx2d.rotate(p.rot * Math.PI / 180);
+        ctx2d.fillStyle = p.color;
+        ctx2d.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+        ctx2d.restore();
+      }
+      if (particles.length > 0) {
+        rafId = requestAnimationFrame(loop);
+      } else {
+        rafId = null;
+        ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+
+    return {
+      burst(count, x, y) { spawn(count || 80, x, y); },
+      celebrate() { spawn(160); }
+    };
+  })();
+
+  /* =========================================================================
+   * ===  SCREEN SHAKE  ===
+   * ========================================================================= */
+  function screenShake(intensity) {
+    const el = document.getElementById('gameScreen') || document.body;
+    const mag = intensity || 6;
+    let t = 0;
+    const frames = 14;
+    function step() {
+      if (t >= frames) { el.style.transform = ''; return; }
+      const dx = (Math.random() - 0.5) * mag * (1 - t / frames);
+      const dy = (Math.random() - 0.5) * mag * (1 - t / frames);
+      el.style.transform = `translate(${dx}px,${dy}px)`;
+      t++;
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+
+  /* =========================================================================
+   * Helpers de UI
+   * ========================================================================= */
+  function $(id) { return document.getElementById(id); }
+
+  function showScreen(id) {
+    document.querySelectorAll('.screen').forEach((s) => s.classList.remove('active'));
+    const el = $(id);
+    if (el) el.classList.add('active');
+  }
+
+  function openModal(id) {
+    const el = $(id);
+    if (el) el.classList.add('open');
+  }
+  function closeModal(id) {
+    const el = $(id);
+    if (el) el.classList.remove('open');
+  }
+
+  function fmt(k) { return `R$${k}k`; }
+
+  function showToast(msg, type) {
+    let container = $('toastContainer');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'toastContainer';
+      container.style.cssText =
+        'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:10000;' +
+        'display:flex;flex-direction:column;gap:8px;align-items:center;';
+      document.body.appendChild(container);
+    }
+    const icons = { error: '⚠️', success: '✅', info: 'ℹ️' };
+    const toast = document.createElement('div');
+    toast.style.cssText =
+      `background:${type === 'error' ? 'linear-gradient(135deg,#b91c1c,#ef4444)' :
+                    type === 'success' ? 'linear-gradient(135deg,#15803d,#22c55e)' :
+                    'linear-gradient(135deg,#1e40af,#3b82f6)'};` +
+      'color:#fff;padding:12px 22px;border-radius:12px;font-weight:700;font-size:14px;' +
+      'box-shadow:0 6px 24px rgba(0,0,0,0.5);opacity:0;transition:opacity 0.25s,transform 0.25s;' +
+      'transform:translateY(10px);max-width:420px;text-align:center;';
+    toast.textContent = (icons[type] || '') + ' ' + msg;
+    container.appendChild(toast);
+    requestAnimationFrame(() => {
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateY(0)';
+    });
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(10px)';
+      setTimeout(() => toast.remove(), 280);
+    }, 3800);
+  }
+
+  function playerColor(color) {
+    return PLAYER_COLOR_CSS[color] || '#64748b';
+  }
+
+  /* =========================================================================
+   * Mute button (injetado dinamicamente)
+   * ========================================================================= */
+  function ensureMuteBtn() {
+    if ($('muteBtn')) return;
+    const btn = document.createElement('button');
+    btn.id = 'muteBtn';
+    btn.title = 'Som ligado/desligado';
+    btn.style.cssText =
+      'position:fixed;top:14px;right:18px;z-index:200;background:rgba(0,0,0,0.5);' +
+      'border:1px solid rgba(255,255,255,0.2);border-radius:10px;padding:7px 12px;' +
+      'color:#e2e8f0;font-size:18px;cursor:pointer;transition:background 0.2s;';
+    btn.textContent = '🔊';
+    btn.addEventListener('click', () => {
+      const m = !SoundEffects.getMute();
+      SoundEffects.setMute(m);
+      btn.textContent = m ? '🔇' : '🔊';
+      btn.style.opacity = m ? '0.5' : '1';
+    });
+    document.body.appendChild(btn);
+  }
+  ensureMuteBtn();
+
+  /* =========================================================================
+   * Dados 3D – animação e faces
+   * ========================================================================= */
+  // Mapeamento: valor → rotação CSS que mostra a face correta
+  const DIE_ROTATIONS = {
+    1: 'rotateX(0deg) rotateY(0deg)',
+    2: 'rotateX(-90deg) rotateY(0deg)',
+    3: 'rotateX(0deg) rotateY(-90deg)',
+    4: 'rotateX(0deg) rotateY(90deg)',
+    5: 'rotateX(90deg) rotateY(0deg)',
+    6: 'rotateX(0deg) rotateY(180deg)'
+  };
+
+  function animateDice(d1, d2, onDone) {
+    const die1 = $('die1');
+    const die2 = $('die2');
+    if (!die1 || !die2) { onDone && onDone(); return; }
+
+    SoundEffects.diceRoll();
+
+    // Remove classes de show antigas
+    for (let i = 1; i <= 6; i++) {
+      die1.classList.remove(`show-${i}`);
+      die2.classList.remove(`show-${i}`);
+    }
+
+    // Adiciona classe de rolagem (girar aleatório)
+    die1.classList.add('rolling');
+    die2.classList.add('rolling');
+
+    // Seta animação caótica via style
+    const chaos1 = `rotateX(${720 + Math.random()*360}deg) rotateY(${720 + Math.random()*360}deg) rotateZ(${Math.random()*360}deg)`;
+    const chaos2 = `rotateX(${720 + Math.random()*360}deg) rotateY(${720 + Math.random()*360}deg) rotateZ(${Math.random()*360}deg)`;
+    die1.style.transform = chaos1;
+    die2.style.transform = chaos2;
+    die1.style.transition = 'transform 1s cubic-bezier(.25,.1,.25,1)';
+    die2.style.transition = 'transform 1s cubic-bezier(.25,.1,.25,1)';
+
+    setTimeout(() => {
+      die1.classList.remove('rolling');
+      die2.classList.remove('rolling');
+
+      // Finaliza na face correta
+      die1.style.transform = DIE_ROTATIONS[d1] || 'rotateX(0deg)';
+      die2.style.transform = DIE_ROTATIONS[d2] || 'rotateX(0deg)';
+      die1.style.transition = 'transform 0.4s ease';
+      die2.style.transition = 'transform 0.4s ease';
+
+      // Efeito dobradinha
+      if (d1 === d2) {
+        showDoublesEffect();
+      }
+
+      setTimeout(() => { onDone && onDone(); }, 450);
+    }, 1050);
+  }
+
+  function showDoublesEffect() {
+    let overlay = $('doublesOverlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'doublesOverlay';
+      overlay.style.cssText =
+        'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) scale(0);' +
+        'z-index:300;text-align:center;pointer-events:none;transition:transform 0.3s cubic-bezier(.34,1.56,.64,1),opacity 0.3s;';
+      overlay.innerHTML =
+        '<div style="background:linear-gradient(135deg,#f59e0b,#d97706);border-radius:20px;padding:16px 32px;' +
+        'box-shadow:0 0 40px rgba(251,191,36,0.8),0 8px 30px rgba(0,0,0,0.6);border:2px solid #fde68a;">' +
+        '<div style="font-size:36px;">🎲🎲</div>' +
+        '<div style="font-size:22px;font-weight:900;color:#fff;text-shadow:0 2px 8px rgba(0,0,0,0.5);">DOBRADINHA!</div>' +
+        '<div style="font-size:13px;font-weight:700;color:#fde68a;margin-top:4px;">JOGUE NOVAMENTE!</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+    }
+    overlay.style.opacity = '1';
+    overlay.style.transform = 'translate(-50%,-50%) scale(1)';
+    setTimeout(() => {
+      overlay.style.opacity = '0';
+      overlay.style.transform = 'translate(-50%,-50%) scale(0.8)';
+    }, 1800);
+  }
+
+  function setDieFace(dieEl, val) {
+    for (let i = 1; i <= 6; i++) dieEl.classList.remove(`show-${i}`);
+    dieEl.classList.add(`show-${val}`);
+    dieEl.style.transition = 'none';
+    dieEl.style.transform = DIE_ROTATIONS[val] || '';
+  }
+
+  /* =========================================================================
+   * Render – Tabuleiro: pawns com animação passo a passo
+   * ========================================================================= */
+
+  // Anima o peão de oldPos → newPos, passo a passo
+  function animatePawnSteps(playerId, oldPos, newPos, color, nickname, onDone) {
+    animatingPawn = true;
+
+    // Calcula o caminho (pode passar pelo GO = 0)
+    let steps = newPos - oldPos;
+    if (steps < 0) steps += 40;
+    if (steps === 0) { animatingPawn = false; onDone && onDone(); return; }
+
+    const path = [];
+    for (let i = 1; i <= steps; i++) {
+      path.push((oldPos + i) % 40);
+    }
+
+    let stepIndex = 0;
+
+    function moveOneStep() {
+      if (stepIndex >= path.length) {
+        animatingPawn = false;
+        onDone && onDone();
+        return;
+      }
+      const pos = path[stepIndex];
+      stepIndex++;
+
+      // Sons de passos
+      SoundEffects.stepPop(stepIndex);
+
+      // Renderiza peão na nova posição com animação de salto
+      renderSinglePawn(playerId, pos, color, nickname, true);
+
+      setTimeout(moveOneStep, 160);
+    }
+
+    // Remover peão da posição atual imediatamente
+    renderSinglePawn(playerId, oldPos, color, nickname, false, true);
+    setTimeout(moveOneStep, 60);
+  }
+
+  // Renderiza/remove um único peão numa casa
+  function renderSinglePawn(playerId, pos, color, nickname, jumping, remove) {
+    // Limpa o peão do jogador em todas as casas
+    document.querySelectorAll('.space-pawns').forEach((c) => {
+      const existing = c.querySelector(`[data-pid="${playerId}"]`);
+      if (existing) existing.remove();
+    });
+
+    if (remove) return;
+
+    const spaceEl = $(`space-${pos}`);
+    if (!spaceEl) return;
+    const pawnsDiv = spaceEl.querySelector('.space-pawns');
+    if (!pawnsDiv) return;
+
+    const pawn = document.createElement('div');
+    pawn.className = 'pawn' + (jumping ? ' jumping' : '');
+    pawn.dataset.pid = playerId;
+    pawn.style.setProperty('--pc', playerColor(color));
+    pawn.title = nickname;
+    pawn.textContent = (nickname || '?')[0].toUpperCase();
+    pawnsDiv.appendChild(pawn);
+  }
+
+  // Renderiza todos os peões no estado atual (sem animação)
+  function renderPawns(players) {
+    if (animatingPawn) return; // não teletransporta durante animação
+    document.querySelectorAll('.space-pawns').forEach((c) => { c.innerHTML = ''; });
+    if (!players) return;
+    for (const p of players) {
+      if (p.bankrupt) continue;
+      const spaceEl = $(`space-${p.position}`);
+      if (!spaceEl) continue;
+      const pawnsDiv = spaceEl.querySelector('.space-pawns');
+      if (!pawnsDiv) continue;
+      const pawn = document.createElement('div');
+      pawn.className = 'pawn';
+      pawn.dataset.pid = p.id;
+      pawn.style.setProperty('--pc', playerColor(p.color));
+      pawn.title = p.nickname;
+      pawn.textContent = (p.nickname || '?')[0].toUpperCase();
+      // Anel pulsante para o jogador da vez
+      if (lastGameState && lastGameState.players) {
+        const cur = lastGameState.players[lastGameState.currentPlayerIndex];
+        if (cur && cur.id === p.id) {
+          pawn.classList.add('active-pawn');
+        }
+      }
+      pawnsDiv.appendChild(pawn);
+    }
+  }
+
+  /* =========================================================================
+   * Render – Casas e hotéis no tabuleiro (miniatura 3D via CSS)
+   * ========================================================================= */
+  function renderBuildings(players) {
+    document.querySelectorAll('.houses').forEach((el) => { el.innerHTML = ''; });
+    if (!players) return;
+    for (const p of players) {
+      const props = p.properties || {};
+      for (const [idx, prop] of Object.entries(props)) {
+        const spaceEl = $(`space-${idx}`);
+        if (!spaceEl) continue;
+        const housesDiv = spaceEl.querySelector('.houses');
+        if (!housesDiv) continue;
+        if (prop.hotel) {
+          const h = document.createElement('div');
+          h.className = 'hotel hotel-3d';
+          h.title = 'Hotel';
+          housesDiv.appendChild(h);
+        } else {
+          for (let i = 0; i < (prop.houses || 0); i++) {
+            const h = document.createElement('div');
+            h.className = 'house house-3d';
+            h.title = `Casa ${i + 1}`;
+            housesDiv.appendChild(h);
+          }
+        }
+      }
+    }
+  }
+
+  /* =========================================================================
+   * Render – Indicador de dono nas casas
+   * ========================================================================= */
+  function renderOwnership(ownership, players) {
+    document.querySelectorAll('.space[data-type="property"],.space[data-type="transport"]').forEach((el) => {
+      el.style.outline = '';
+      el.style.boxShadow = '';
+    });
+    if (!ownership || !players) return;
+    for (const [idx, ownerId] of Object.entries(ownership)) {
+      const owner = players.find((p) => p.id === ownerId);
+      if (!owner) continue;
+      const spaceEl = $(`space-${idx}`);
+      if (!spaceEl) continue;
+      const c = playerColor(owner.color);
+      spaceEl.style.outline = `2px solid ${c}`;
+      spaceEl.style.boxShadow = `inset 0 0 4px ${c}44`;
+    }
+  }
+
+  /* =========================================================================
+   * Render – Floating money
+   * ========================================================================= */
+  function floatMoney(amount, gain) {
+    const container = $('floatingMoney');
+    if (!container) return;
+    const el = document.createElement('div');
+    el.className = `float-money ${gain ? 'gain' : 'loss'}`;
+    el.textContent = `${gain ? '+' : '−'}R$${Math.abs(amount)}k`;
+    el.style.left = `${15 + Math.random() * 70}%`;
+    el.style.top  = `${30 + Math.random() * 30}%`;
+    container.appendChild(el);
+    setTimeout(() => el.remove(), 1600);
+
+    if (gain) SoundEffects.cashRegister();
+    else SoundEffects.cashLoss();
+  }
+
+  /* =========================================================================
+   * Render – Painel de jogadores
+   * ========================================================================= */
+  function renderPlayers(players, currentPlayerIndex, myId) {
+    const list = $('playersList');
+    if (!list || !players) return;
+    list.innerHTML = '';
+    const tpl = $('playerCardTemplate');
+
+    players.forEach((p, i) => {
+      let card;
+      if (tpl) {
+        const clone = tpl.content.cloneNode(true);
+        card = clone.querySelector('.player-card');
+        const chip     = card.querySelector('.player-chip');
+        const initial  = card.querySelector('.pc-initial');
+        const nickname = card.querySelector('.pc-nickname');
+        const balance  = card.querySelector('.pc-balance');
+        const propsDiv = card.querySelector('.pc-props');
+
+        if (chip) chip.style.setProperty('--pc', playerColor(p.color));
+        if (initial) initial.textContent = (p.nickname || '?')[0].toUpperCase();
+        if (nickname) {
+          nickname.textContent = p.nickname;
+          if (!p.connected) {
+            const dc = document.createElement('span');
+            dc.className = 'text-xs text-slate-500 ml-1';
+            dc.textContent = '(desconectado)';
+            nickname.appendChild(dc);
+          }
+        }
+        if (balance) balance.textContent = fmt(p.balance);
+
+        if (propsDiv) {
+          const props = p.properties || {};
+          for (const [idx, prop] of Object.entries(props)) {
+            const spaceEl = $(`space-${idx}`);
+            const color   = spaceEl ? spaceEl.dataset.color : null;
+            const dot = document.createElement('div');
+            dot.className = 'prop-chip';
+            dot.style.background = color ? (COLOR_CSS[color] || '#64748b') : '#64748b';
+            if (prop.mortgaged) dot.style.opacity = '0.35';
+            if (prop.hotel) dot.style.border = '1px solid #facc15';
+            dot.title = spaceEl ? spaceEl.dataset.name : `#${idx}`;
+            propsDiv.appendChild(dot);
+          }
+        }
+      } else {
+        card = document.createElement('div');
+        card.className = 'player-card';
+        card.innerHTML = `<strong>${p.nickname}</strong> — ${fmt(p.balance)}`;
+      }
+
+      if (card) {
+        card.dataset.pid = p.id;
+        if (i === currentPlayerIndex) card.classList.add('active-turn');
+        if (p.bankrupt) card.classList.add('bankrupt');
+        if (p.id === myId) card.style.boxShadow = '0 0 0 2px rgba(250,204,21,0.6)';
+        list.appendChild(card);
+      }
+    });
+  }
+
+  /* =========================================================================
+   * Render – Barra de ações
+   * ========================================================================= */
+  function renderActionBar(gs, myId) {
+    const actionBar   = $('actionBar');
+    const jailControls = $('jailControls');
+    const rollBtn     = $('rollDiceBtn');
+    const buildBtn    = $('buildBtn');
+    const mortgageBtn = $('mortgageBtn');
+    const tradeBtn    = $('tradeBtn');
+    const endTurnBtn  = $('endTurnBtn');
+    if (!actionBar) return;
+
+    const isMyTurn = gs.players &&
+      gs.players[gs.currentPlayerIndex] &&
+      gs.players[gs.currentPlayerIndex].id === myId;
+    const myPlayer = gs.players ? gs.players.find((p) => p.id === myId) : null;
+    const phase    = gs.turnPhase;
+
+    if (isMyTurn && myPlayer && !myPlayer.bankrupt) {
+      actionBar.classList.remove('hidden');
+      actionBar.style.display = 'grid';
+
+      if (rollBtn) {
+        const canRoll = phase === TURN_PHASE.WAITING_ROLL && !myPlayer.inJail;
+        rollBtn.disabled = !canRoll;
+        rollBtn.classList.toggle('hidden', myPlayer.inJail);
+      }
+      if (endTurnBtn) endTurnBtn.disabled = phase !== TURN_PHASE.TURN_ACTIONS;
+      if (buildBtn)    buildBtn.disabled    = false;
+      if (mortgageBtn) mortgageBtn.disabled = false;
+      if (tradeBtn)    tradeBtn.disabled    = false;
+
+      if (jailControls) {
+        if (myPlayer.inJail && phase === TURN_PHASE.WAITING_ROLL) {
+          jailControls.classList.remove('hidden');
+          const cardBtn = $('jailCardBtn');
+          if (cardBtn) cardBtn.disabled = myPlayer.getOutJailFreeCards < 1;
+        } else {
+          jailControls.classList.add('hidden');
+        }
+      }
+    } else {
+      actionBar.classList.add('hidden');
+      if (jailControls) jailControls.classList.add('hidden');
+    }
+  }
+
+  /* =========================================================================
+   * Render – Indicador de turno
+   * ========================================================================= */
+  function renderTurnIndicator(gs) {
+    const el = $('turnIndicator');
+    if (!el || !gs.players) return;
+    const cur = gs.players[gs.currentPlayerIndex];
+    if (!cur) { el.textContent = 'Aguardando...'; return; }
+    const phaseMap = {
+      [TURN_PHASE.WAITING_ROLL]:           'rolar os dados',
+      [TURN_PHASE.WAITING_BUY_DECISION]:   'decidir compra',
+      [TURN_PHASE.TURN_ACTIONS]:           'encerrar turno',
+      [TURN_PHASE.BANKRUPTCY_RESOLUTION]:  'resolver falência'
+    };
+    el.innerHTML =
+      `<span style="color:${playerColor(cur.color)};font-weight:900;">${cur.nickname}</span>` +
+      ` &mdash; ${phaseMap[gs.turnPhase] || ''}`;
+  }
+
+  /* =========================================================================
+   * Render – Log de eventos
+   * ========================================================================= */
+  function renderLog(log) {
+    let logEl = $('gameLog');
+    if (!logEl) {
+      logEl = document.createElement('div');
+      logEl.id = 'gameLog';
+      logEl.style.cssText =
+        'max-height:130px;overflow-y:auto;font-size:11px;color:#94a3b8;' +
+        'background:rgba(0,0,0,0.25);border-radius:10px;padding:8px 10px;margin-top:10px;' +
+        'border:1px solid rgba(255,255,255,0.06);';
+      const panel = $('playerPanel');
+      if (panel) panel.appendChild(logEl);
+    }
+    if (!Array.isArray(log) || log.length === 0) return;
+    logEl.innerHTML = log.slice(-10)
+      .map((l) => `<div style="padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.04);">${l}</div>`)
+      .join('');
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  /* =========================================================================
+   * applyGameState – Render completo + side effects
+   * ========================================================================= */
+  function applyGameState(gs) {
+    if (!gs) return;
+
+    // Detectar mudanças de saldo e posição
+    const prevState = lastGameState;
+    if (prevState && prevState.players && gs.players) {
+      for (const prevP of prevState.players) {
+        const nextP = gs.players.find((p) => p.id === prevP.id);
+        if (!nextP) continue;
+
+        // Saldo
+        const diff = nextP.balance - prevP.balance;
+        if (diff !== 0) floatMoney(Math.abs(diff), diff > 0);
+
+        // Posição – animar passo a passo
+        if (prevP.position !== nextP.position && !nextP.bankrupt) {
+          const color    = nextP.color;
+          const nickname = nextP.nickname;
+          const oldPos   = prevP.position;
+          const newPos   = nextP.position;
+
+          // Se foi para a Delegacia (goToJail)
+          if (oldPos !== 10 && newPos === 10) {
+            SoundEffects.goToJail();
+            screenShake(8);
+          }
+
+          // Detectar passagem pelo GO
+          if (newPos < oldPos) {
+            // Passou pelo Início
+            setTimeout(() => {
+              Confetti.burst(50);
+              SoundEffects.cashRegister();
+            }, (newPos + 40 - oldPos) * 160 + 200);
+          }
+
+          animatePawnSteps(nextP.id, oldPos, newPos, color, nickname, () => {
+            // Após terminar a animação, renderiza todos os peões estáticos
+            renderPawns(gs.players);
+            // Abre modal de compra se estava pendente
+            if (pendingBuyAfterAnim) {
+              showBuyDecision(pendingBuyAfterAnim);
+              pendingBuyAfterAnim = null;
+            }
+          });
+        }
+      }
+
+      // Detectar aluguel alto pago (perda > 300k)
+      const myPrev = prevState.players.find((p) => p.id === myPlayerId);
+      const myNext = gs.players.find((p) => p.id === myPlayerId);
+      if (myPrev && myNext && myPrev.balance - myNext.balance > 300) {
+        screenShake(5);
+      }
+
+      // Detectar construção de hotel
+      for (const prevP of prevState.players) {
+        const nextP = gs.players.find((p) => p.id === prevP.id);
+        if (!nextP) continue;
+        for (const [idx, prop] of Object.entries(nextP.properties || {})) {
+          const prevProp = (prevP.properties || {})[idx];
+          if (!prevProp) {
+            // Acabou de comprar
+            if (nextP.id === myPlayerId) {
+              setTimeout(() => Confetti.burst(60), 200);
+            }
+          } else if (!prevProp.hotel && prop.hotel) {
+            // Construiu hotel
+            SoundEffects.buildHotel();
+            setTimeout(() => Confetti.burst(80), 100);
+          } else if ((prevProp.houses || 0) < (prop.houses || 0)) {
+            SoundEffects.buildHouse();
+          }
+        }
+      }
+    }
+
+    lastGameState = gs;
+    if (!animatingPawn) renderPawns(gs.players);
+    renderBuildings(gs.players);
+    renderOwnership(gs.ownership, gs.players);
+    renderPlayers(gs.players, gs.currentPlayerIndex, myPlayerId);
+    renderActionBar(gs, myPlayerId);
+    renderTurnIndicator(gs);
+    renderLog(gs.log);
+
+    if (gs.dice) {
+      setDieFace($('die1'), gs.dice[0]);
+      setDieFace($('die2'), gs.dice[1]);
+    }
+
+    // Decisão de compra
+    if (gs.turnPhase === TURN_PHASE.WAITING_BUY_DECISION &&
+        gs.pendingDecision &&
+        gs.players &&
+        gs.players[gs.currentPlayerIndex] &&
+        gs.players[gs.currentPlayerIndex].id === myPlayerId) {
+      if (animatingPawn) {
+        pendingBuyAfterAnim = gs.pendingDecision.spaceIndex;
+      } else {
+        showBuyDecision(gs.pendingDecision.spaceIndex);
+      }
+    }
+
+    // Falência
+    if (gs.turnPhase === TURN_PHASE.BANKRUPTCY_RESOLUTION &&
+        gs.pendingDecision &&
+        gs.pendingDecision.playerId === myPlayerId) {
+      showToast('Você está insolvente! Hipoteque imóveis ou declare falência.', 'error');
+      screenShake(6);
+      openModal('mortgageBuildPanel');
+      renderMortgagePanel();
+    }
+  }
+
+  /* =========================================================================
+   * Tabelas de dados de propriedades (cliente)
+   * ========================================================================= */
+  function spaceDataFromIndex(idx) {
+    const el = $(`space-${idx}`);
+    if (!el) return null;
+    return {
+      index:  idx,
+      name:   el.dataset.name,
+      type:   el.dataset.type,
+      color:  el.dataset.color,
+      price:  parseInt(el.dataset.price  || '0', 10),
+      amount: parseInt(el.dataset.amount || '0', 10)
+    };
+  }
+
+  const RENT_TABLE = {
+    1:[6,30,90,270,400,500], 3:[2,10,30,90,160,250], 4:[4,20,60,180,320,450],
+    6:[20,100,300,750,925,1100], 8:[18,90,250,700,875,1050], 9:[18,90,250,700,875,1050],
+    11:[16,80,220,600,800,1000], 13:[14,70,200,550,750,950], 14:[14,70,200,550,750,950],
+    17:[35,175,500,1100,1300,1500], 19:[50,200,600,1400,1700,2000],
+    21:[8,40,100,300,450,600], 23:[6,30,90,270,400,500],
+    26:[12,60,180,500,700,900], 28:[10,50,150,450,625,750], 29:[10,50,150,450,625,750],
+    31:[22,110,330,800,975,1150], 33:[28,150,450,1000,1200,1400],
+    34:[26,130,390,900,1100,1275], 36:[26,130,390,900,1100,1275],
+    38:[24,120,360,850,1025,1200], 39:[22,110,330,800,975,1150]
+  };
+  const HOUSE_COST_TABLE = {
+    1:50,3:50,4:50,6:150,8:150,9:150,11:100,13:100,14:100,
+    17:200,19:200,21:50,23:50,26:100,28:100,29:100,
+    31:150,33:200,34:200,36:200,38:150,39:150
+  };
+  const MORTGAGE_TABLE = {
+    1:50,3:30,4:30,5:100,6:120,7:75,8:110,9:110,11:100,13:90,14:90,15:75,
+    17:175,19:200,21:60,23:50,25:75,26:80,28:70,29:70,
+    31:130,32:100,33:160,34:150,35:100,36:150,38:140,39:130
+  };
+
+  /* =========================================================================
+   * Modal de escritura (deed) – com flip 3D na abertura
+   * ========================================================================= */
+  function populateDeed(spaceIndex) {
+    const space = spaceDataFromIndex(spaceIndex);
+    if (!space) return;
+    const header   = $('deedHeader');
+    const name     = $('deedName');
+    const price    = $('deedPrice');
+    const mortgage = $('deedMortgage');
+    const houseCost = $('deedHouseCost');
+    if (header)   header.style.setProperty('--bar', COLOR_CSS[space.color] || '#64748b');
+    if (name)     name.textContent = space.name;
+    if (price)    price.textContent = space.price ? fmt(space.price) : '—';
+    if (mortgage) mortgage.textContent = fmt(MORTGAGE_TABLE[spaceIndex] || Math.floor(space.price / 2));
+    if (houseCost) houseCost.textContent = HOUSE_COST_TABLE[spaceIndex] ? fmt(HOUSE_COST_TABLE[spaceIndex]) : '—';
+    const rents = RENT_TABLE[spaceIndex];
+    for (let i = 0; i <= 5; i++) {
+      const el = $(`rent${i}`);
+      if (el) el.textContent = rents ? fmt(rents[i]) : '—';
+    }
+  }
+
+  function openDeedWithFlip() {
+    const card = $('deedCard');
+    if (card) {
+      card.style.transform = 'rotateY(90deg) scale(0.8)';
+      card.style.opacity = '0';
+      card.style.transition = 'none';
+      openModal('deedModal');
+      requestAnimationFrame(() => {
+        card.style.transition = 'transform 0.4s cubic-bezier(.34,1.56,.64,1), opacity 0.3s';
+        card.style.transform  = 'rotateY(0deg) scale(1)';
+        card.style.opacity    = '1';
+      });
+    } else {
+      openModal('deedModal');
+    }
+  }
+
+  function showBuyDecision(spaceIndex) {
+    populateDeed(spaceIndex);
+    const buyBtn  = $('deedBuy');
+    const passBtn = $('deedPass');
+    const closeBtn = $('deedClose');
+    if (buyBtn) {
+      buyBtn.classList.remove('hidden');
+      buyBtn.disabled = false;
+      buyBtn.onclick = () => {
+        socket.emit('buyDecision', { buy: true });
+        closeModal('deedModal');
+        SoundEffects.cashRegister();
+        setTimeout(() => Confetti.burst(70), 100);
+      };
+    }
+    if (passBtn) {
+      passBtn.classList.remove('hidden');
+      passBtn.onclick = () => {
+        socket.emit('buyDecision', { buy: false });
+        closeModal('deedModal');
+      };
+    }
+    if (closeBtn) closeBtn.classList.add('hidden');
+    openDeedWithFlip();
+  }
+
+  function showPropertyInfo(spaceIndex) {
+    const space = spaceDataFromIndex(spaceIndex);
+    if (!space || space.type === 'chance' || space.type === 'go' || space.type === 'freeparking') return;
+    populateDeed(spaceIndex);
+    const buyBtn  = $('deedBuy');
+    const passBtn = $('deedPass');
+    const closeBtn = $('deedClose');
+    if (buyBtn)  buyBtn.classList.add('hidden');
+    if (passBtn) passBtn.classList.add('hidden');
+    if (closeBtn) {
+      closeBtn.classList.remove('hidden');
+      closeBtn.onclick = () => closeModal('deedModal');
+    }
+    openDeedWithFlip();
+  }
+
+  document.querySelectorAll('.space[data-type="property"], .space[data-type="transport"]').forEach((el) => {
+    el.style.cursor = 'pointer';
+    el.addEventListener('click', () => showPropertyInfo(parseInt(el.dataset.index, 10)));
+  });
+
+  /* =========================================================================
+   * Mortgage/Build panel
+   * ========================================================================= */
+  function renderMortgagePanel() {
+    const gs   = lastGameState;
+    const list = $('mortgageProps');
+    if (!list || !gs || !gs.players) return;
+    list.innerHTML = '';
+    const me = gs.players.find((p) => p.id === myPlayerId);
+    if (!me) return;
+    const tpl = $('mortgageRowTemplate');
+
+    for (const [idx, prop] of Object.entries(me.properties)) {
+      const spaceIndex    = parseInt(idx, 10);
+      const space         = spaceDataFromIndex(spaceIndex);
+      if (!space) continue;
+      const mortgageVal   = MORTGAGE_TABLE[spaceIndex] || 0;
+      const unmortgageCost = Math.floor(mortgageVal * 1.1);
+      const houseCost     = HOUSE_COST_TABLE[spaceIndex] || 0;
+
+      let row;
+      if (tpl) {
+        const clone = tpl.content.cloneNode(true);
+        row = clone.querySelector('li');
+        const bar         = row.querySelector('.mr-rowbar');
+        const nameEl      = row.querySelector('.mr-name');
+        const housesEl    = row.querySelector('.mr-houses');
+        const buildBtn    = row.querySelector('.mr-build');
+        const sellBtn     = row.querySelector('.mr-sell');
+        const mortBtn     = row.querySelector('.mr-mortgage');
+        const unmortBtn   = row.querySelector('.mr-unmortgage');
+        const mval        = row.querySelector('.mr-mval');
+        const uval        = row.querySelector('.mr-uval');
+
+        if (bar)     bar.style.background = COLOR_CSS[space.color] || '#888';
+        if (nameEl)  nameEl.textContent   = space.name;
+        if (housesEl) housesEl.textContent = prop.hotel ? '🏨 Hotel' : prop.houses > 0 ? `🏠×${prop.houses}` : 'Sem construções';
+        if (mval)    mval.textContent     = fmt(mortgageVal);
+        if (uval)    uval.textContent     = fmt(unmortgageCost);
+
+        if (buildBtn) {
+          buildBtn.disabled = !(space.type === 'property' && !prop.mortgaged && !prop.hotel && houseCost > 0);
+          buildBtn.onclick  = () => socket.emit('build', { spaceIndex, action: 'build' });
+        }
+        if (sellBtn) {
+          sellBtn.disabled  = !(prop.houses > 0 || prop.hotel) || space.type !== 'property';
+          sellBtn.onclick   = () => socket.emit('build', { spaceIndex, action: 'sell' });
+        }
+        if (mortBtn) {
+          mortBtn.disabled  = prop.mortgaged || prop.hotel || prop.houses > 0;
+          mortBtn.onclick   = () => socket.emit('mortgage', { spaceIndex, action: 'mortgage' });
+        }
+        if (unmortBtn) {
+          unmortBtn.disabled = !prop.mortgaged;
+          unmortBtn.onclick  = () => socket.emit('mortgage', { spaceIndex, action: 'unmortgage' });
+        }
+      } else {
+        row = document.createElement('li');
+        row.textContent = space.name;
+      }
+      if (row) list.appendChild(row);
+    }
+    if (!Object.keys(me.properties).length) {
+      list.innerHTML = '<li class="text-slate-400 text-center py-4">Nenhum imóvel.</li>';
+    }
+  }
+
+  /* =========================================================================
+   * Trade modal
+   * ========================================================================= */
+  function openTradeModal() {
+    const gs     = lastGameState;
+    if (!gs || !gs.players) return;
+    const select = $('tradeTarget');
+    if (!select) return;
+    select.innerHTML = '<option value="">Selecione um magnata...</option>';
+    for (const p of gs.players) {
+      if (p.id === myPlayerId || p.bankrupt) continue;
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.nickname;
+      select.appendChild(opt);
+    }
+    renderTradeProps();
+    openModal('tradeModal');
+  }
+
+  function renderTradeProps() {
+    const gs = lastGameState;
+    if (!gs || !gs.players) return;
+    const me       = gs.players.find((p) => p.id === myPlayerId);
+    const targetId = $('tradeTarget') ? $('tradeTarget').value : '';
+    const target   = targetId ? gs.players.find((p) => p.id === targetId) : null;
+    renderTradePropList($('tradeOfferProps'),   me     ? me.properties     : {}, 'offer');
+    renderTradePropList($('tradeRequestProps'), target ? target.properties : {}, 'request');
+  }
+
+  function renderTradePropList(container, props, prefix) {
+    if (!container) return;
+    container.innerHTML = '';
+    for (const [idx] of Object.entries(props)) {
+      const spaceIndex = parseInt(idx, 10);
+      const space      = spaceDataFromIndex(spaceIndex);
+      if (!space) continue;
+      const label = document.createElement('label');
+      label.className = 'flex items-center gap-2 text-sm cursor-pointer';
+      const cb  = document.createElement('input');
+      cb.type   = 'checkbox';
+      cb.value  = spaceIndex;
+      cb.name   = `${prefix}-prop`;
+      cb.className = 'accent-amber-400';
+      const dot = document.createElement('span');
+      dot.style.cssText = `width:10px;height:10px;border-radius:2px;background:${COLOR_CSS[space.color]||'#888'};display:inline-block;`;
+      label.appendChild(cb); label.appendChild(dot);
+      label.appendChild(document.createTextNode(space.name));
+      container.appendChild(label);
+    }
+    if (!Object.keys(props).length) {
+      container.innerHTML = '<div class="text-slate-400 text-xs">Nenhum imóvel</div>';
+    }
+  }
+
+  /* =========================================================================
+   * Lobby
+   * ========================================================================= */
+  function applyRoomState(room) {
+    const roomName    = $('lobbyRoomName');
+    const playerCount = $('lobbyPlayerCount');
+    const lobbyList   = $('lobbyPlayers');
+    const startBtn    = $('startGameBtn');
+    if (roomName)    roomName.textContent    = room.name;
+    if (playerCount) playerCount.textContent = `${room.players.length}/6`;
+
+    if (lobbyList) {
+      lobbyList.innerHTML = '';
+      const tpl = $('lobbyPlayerTemplate');
+      for (const p of room.players) {
+        let li;
+        if (tpl) {
+          const clone = tpl.content.cloneNode(true);
+          li = clone.querySelector('li');
+          const chip      = li.querySelector('.player-chip');
+          const initial   = li.querySelector('.lp-initial');
+          const nickname  = li.querySelector('.lp-nickname');
+          const hostBadge = li.querySelector('.lp-host');
+          if (chip) chip.style.setProperty('--pc', playerColor(p.color));
+          if (initial) initial.textContent = (p.nickname || '?')[0].toUpperCase();
+          if (nickname) {
+            nickname.textContent = p.nickname;
+            if (p.color) {
+              const badge = document.createElement('span');
+              badge.style.cssText = `width:10px;height:10px;border-radius:50%;background:${playerColor(p.color)};display:inline-block;margin-left:6px;`;
+              nickname.appendChild(badge);
+            }
+          }
+          if (hostBadge && p.nickname === room.hostNickname) hostBadge.classList.remove('hidden');
+        } else {
+          li = document.createElement('li');
+          li.textContent = p.nickname;
+        }
+        if (li) lobbyList.appendChild(li);
+      }
+    }
+
+    document.querySelectorAll('.color-swatch').forEach((sw) => {
+      const color = sw.dataset.color;
+      const taken = room.players.some((p) => p.color === color && p.id !== myPlayerId);
+      const mine  = room.players.find((p) => p.id === myPlayerId && p.color === color);
+      sw.classList.toggle('taken', taken);
+      sw.classList.toggle('selected', !!mine);
+    });
+
+    if (startBtn) {
+      const imHost = room.players.some((p) => p.id === myPlayerId) &&
+        room.hostNickname === (room.players.find((p) => p.id === myPlayerId) || {}).nickname;
+      startBtn.classList.toggle('hidden', !imHost);
+      startBtn.disabled = room.players.length < 2;
+    }
+  }
+
+  function renderRoomsList(rooms) {
+    const list  = $('roomsList');
+    const empty = $('roomsEmpty');
+    const tpl   = $('roomRowTemplate');
+    if (!list) return;
+    list.querySelectorAll('.room-row').forEach((r) => r.remove());
+    if (!rooms || rooms.length === 0) { if (empty) empty.style.display = 'block'; return; }
+    if (empty) empty.style.display = 'none';
+    for (const room of rooms) {
+      let li;
+      if (tpl) {
+        const clone    = tpl.content.cloneNode(true);
+        li             = clone.querySelector('li');
+        const lockIcon = li.querySelector('.room-lock');
+        const nameEl   = li.querySelector('.room-name');
+        const hostEl   = li.querySelector('.room-host');
+        const countEl  = li.querySelector('.room-count');
+        const statusEl = li.querySelector('.room-status');
+        const joinBtn  = li.querySelector('.join-btn');
+        if (lockIcon) lockIcon.classList.toggle('hidden', !room.hasPassword);
+        if (nameEl)   nameEl.textContent  = room.roomName;
+        if (hostEl)   hostEl.textContent  = room.hostNickname;
+        if (countEl)  countEl.textContent = `${room.playerCount}/${room.maxPlayers}`;
+        if (statusEl) {
+          statusEl.textContent  = room.status === 'playing' ? 'Em jogo' : 'Lobby';
+          statusEl.style.background = room.status === 'playing' ? 'rgba(34,197,94,0.2)' : 'rgba(148,163,184,0.2)';
+          statusEl.style.color      = room.status === 'playing' ? '#22c55e' : '#94a3b8';
+        }
+        if (joinBtn) {
+          joinBtn.disabled = room.playerCount >= room.maxPlayers || room.status === 'playing';
+          joinBtn.onclick  = () => attemptJoinRoom(room);
+        }
+      } else {
+        li = document.createElement('li');
+        li.className   = 'room-row';
+        li.textContent = room.roomName;
+      }
+      if (li) list.appendChild(li);
+    }
+  }
+
+  function attemptJoinRoom(room) {
+    if (room.hasPassword) {
+      pendingJoinRoomId = room.roomId;
+      const pi = $('passwordInput');
+      const pe = $('passwordError');
+      if (pi) pi.value = '';
+      if (pe) pe.classList.add('hidden');
+      openModal('passwordModal');
+    } else {
+      doJoinRoom(room.roomId, '');
+    }
+  }
+
+  function doJoinRoom(roomId, password) {
+    socket.emit('joinRoom', { roomId, password, nickname: myNickname, sessionId: mySessionId });
+  }
+
+  /* =========================================================================
+   * Socket.io handlers
+   * ========================================================================= */
+  socket.on('connect', () => {
+    const statusP = document.querySelector('#nicknameScreen p.text-slate-500');
+    if (statusP) statusP.textContent = '✅ Conectado ao servidor!';
+    if (myNickname && mySessionId) {
+      socket.emit('setNickname', { nickname: myNickname, sessionId: mySessionId });
+      if (myRoomId) socket.emit('joinRoom', { roomId: myRoomId, nickname: myNickname, sessionId: mySessionId });
+    }
+    socket.emit('getRooms');
+  });
+
+  socket.on('disconnect', () => showToast('Desconectado. Reconectando...', 'error'));
+  socket.on('error',      (d) => { showToast(d.message || 'Erro.', 'error'); });
+
+  // Exibe erro de senha dentro do modal
+  socket.on('error', (data) => {
+    const pwModal = $('passwordModal');
+    if (pwModal && pwModal.classList.contains('open') && /incorreta/i.test(data.message)) {
+      const errEl = $('passwordError');
+      if (errEl) errEl.classList.remove('hidden');
+    }
+  });
+
+  socket.on('roomsListUpdate', (rooms) => renderRoomsList(rooms));
+
+  socket.on('joinedRoom', (data) => {
+    myPlayerId = data.playerId;
+    myRoomId   = data.roomId;
+    if (data.room) applyRoomState(data.room);
+    showScreen(data.room && data.room.status === 'playing' ? 'gameScreen' : 'inRoomLobby');
+  });
+
+  socket.on('roomState', (room) => {
+    if (room.status === 'playing') showScreen('gameScreen');
+    else applyRoomState(room);
+  });
+
+  socket.on('gameState', (gs) => {
+    showScreen('gameScreen');
+    applyGameState(gs);
+    if (gs.turnPhase !== TURN_PHASE.WAITING_BUY_DECISION) closeModal('deedModal');
+    // Atualizar painel de hipoteca aberto
+    const panel = $('mortgageBuildPanel');
+    if (panel && panel.classList.contains('open')) renderMortgagePanel();
+  });
+
+  socket.on('gameOver', (data) => {
+    const gs     = lastGameState;
+    const winner = gs && gs.players ? gs.players.find((p) => p.id === data.winnerId) : null;
+    showToast(winner ? `🏆 ${winner.nickname} venceu a partida!` : 'Partida encerrada!', 'success');
+    if (winner) {
+      SoundEffects.victory();
+      setTimeout(() => Confetti.celebrate(), 100);
+    }
+    const ti = $('turnIndicator');
+    if (ti) ti.innerHTML = winner
+      ? `<span style="color:#facc15;font-weight:900;">🏆 ${winner.nickname} venceu!</span>`
+      : '<span>Partida encerrada</span>';
+    const ab = $('actionBar');
+    if (ab) ab.classList.add('hidden');
+  });
+
+  socket.on('leftRoom', () => {
+    myRoomId = null;
+    showScreen('roomBrowser');
+    socket.emit('getRooms');
+  });
+
+  socket.on('tradeProposal', (trade) => {
+    const offerEl   = $('tradeIncomingOffer');
+    const requestEl = $('tradeIncomingRequest');
+    if (offerEl) {
+      offerEl.innerHTML =
+        trade.offerProps.map((p) => `<div>🏠 ${p.name}</div>`).join('') +
+        (trade.offerMoney > 0 ? `<div>💰 R$${trade.offerMoney}k</div>` : '');
+    }
+    if (requestEl) {
+      requestEl.innerHTML =
+        trade.requestProps.map((p) => `<div>🏠 ${p.name}</div>`).join('') +
+        (trade.requestMoney > 0 ? `<div>💰 R$${trade.requestMoney}k</div>` : '');
+    }
+    const acceptBtn = $('tradeAccept');
+    const refuseBtn = $('tradeRefuse');
+    if (acceptBtn) acceptBtn.onclick = () => {
+      socket.emit('respondTrade', { tradeId: trade.tradeId, accept: true });
+      closeModal('tradeIncoming');
+    };
+    if (refuseBtn) refuseBtn.onclick = () => {
+      socket.emit('respondTrade', { tradeId: trade.tradeId, accept: false });
+      closeModal('tradeIncoming');
+    };
+    openModal('tradeIncoming');
+  });
+
+  /* =========================================================================
+   * Bindings de botões
+   * ========================================================================= */
+  const enterBtn     = $('enterBtn');
+  const nicknameInput = $('nicknameInput');
+  if (enterBtn) {
+    enterBtn.addEventListener('click', () => {
+      const nick = nicknameInput ? nicknameInput.value.trim() : '';
+      if (!nick) { nicknameInput && nicknameInput.focus(); return; }
+      myNickname = nick;
+      try { localStorage.setItem('mb_nick', nick); } catch(e) {}
+      socket.emit('setNickname', { nickname: nick, sessionId: mySessionId });
+      socket.emit('getRooms');
+      showScreen('roomBrowser');
+    });
+  }
+  if (nicknameInput) nicknameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && enterBtn) enterBtn.click(); });
+
+  const createRoomBtn     = $('createRoomBtn');
+  const createRoomConfirm = $('createRoomConfirm');
+  const createRoomCancel  = $('createRoomCancel');
+  if (createRoomBtn)     createRoomBtn.addEventListener('click', () => openModal('createRoomModal'));
+  if (createRoomCancel)  createRoomCancel.addEventListener('click', () => closeModal('createRoomModal'));
+  if (createRoomConfirm) {
+    createRoomConfirm.addEventListener('click', () => {
+      const roomName = ($('createRoomName') || {}).value.trim();
+      const password = ($('createRoomPassword') || {}).value;
+      if (!roomName) { showToast('Nome da sala obrigatório.', 'error'); return; }
+      socket.emit('createRoom', { roomName, password, nickname: myNickname, sessionId: mySessionId });
+      closeModal('createRoomModal');
+      if ($('createRoomName'))     $('createRoomName').value = '';
+      if ($('createRoomPassword')) $('createRoomPassword').value = '';
+    });
+  }
+
+  const passwordConfirm = $('passwordConfirm');
+  const passwordCancel  = $('passwordCancel');
+  const passwordInput   = $('passwordInput');
+  if (passwordCancel)  passwordCancel.addEventListener('click',  () => { closeModal('passwordModal'); pendingJoinRoomId = null; });
+  if (passwordConfirm) passwordConfirm.addEventListener('click', () => {
+    const pw = passwordInput ? passwordInput.value : '';
+    if (pendingJoinRoomId) { doJoinRoom(pendingJoinRoomId, pw); closeModal('passwordModal'); }
+  });
+  if (passwordInput) passwordInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && passwordConfirm) passwordConfirm.click(); });
+
+  const leaveRoomBtn  = $('leaveRoomBtn');
+  const startGameBtn  = $('startGameBtn');
+  if (leaveRoomBtn)  leaveRoomBtn.addEventListener('click',  () => socket.emit('leaveRoom'));
+  if (startGameBtn)  startGameBtn.addEventListener('click',  () => socket.emit('startGame'));
+
+  document.querySelectorAll('.color-swatch').forEach((sw) => {
+    sw.addEventListener('click', () => {
+      if (sw.classList.contains('taken')) return;
+      socket.emit('selectColor', { color: sw.dataset.color });
+    });
+  });
+
+  // Roll dice – dispara animação dos dados antes de enviar ao servidor
+  const rollDiceBtn = $('rollDiceBtn');
+  if (rollDiceBtn) {
+    rollDiceBtn.addEventListener('click', () => {
+      rollDiceBtn.disabled = true;
+      socket.emit('rollDice');
+    });
+  }
+
+  // Intercepta o gameState para animar os dados com o resultado do servidor
+  const _origGameState = socket.listeners ? null : null; // compatibilidade
+  socket.on('gameState', (gs) => {
+    if (gs.lastRoll && gs.dice) {
+      const prevDice = lastGameState ? lastGameState.dice : null;
+      if (!prevDice || prevDice[0] !== gs.dice[0] || prevDice[1] !== gs.dice[1]) {
+        animateDice(gs.dice[0], gs.dice[1], null);
+      }
+    }
+    const rollBtn2 = $('rollDiceBtn');
+    if (rollBtn2) rollBtn2.disabled = false;
+  });
+
+  // End turn
+  (function () {
+    const ab = $('actionBar');
+    if (!ab || $('endTurnBtn')) return;
+    const btn = document.createElement('button');
+    btn.id = 'endTurnBtn';
+    btn.className = 'btn btn-ghost col-span-2 flex items-center justify-center gap-2';
+    btn.innerHTML = '<i class="fa-solid fa-check"></i> Encerrar Turno';
+    btn.addEventListener('click', () => socket.emit('endTurn'));
+    ab.appendChild(btn);
+  })();
+
+  const jailPayBtn  = $('jailPayBtn');
+  const jailCardBtn = $('jailCardBtn');
+  const jailRollBtn = $('jailRollBtn');
+  if (jailPayBtn)  jailPayBtn.addEventListener('click',  () => socket.emit('jailAction', { action: 'pay' }));
+  if (jailCardBtn) jailCardBtn.addEventListener('click', () => socket.emit('jailAction', { action: 'card' }));
+  if (jailRollBtn) jailRollBtn.addEventListener('click', () => {
+    socket.emit('jailAction', { action: 'roll' });
+    setTimeout(() => socket.emit('rollDice'), 100);
+  });
+
+  const buildBtn    = $('buildBtn');
+  const mortgageBtn = $('mortgageBtn');
+  const mortgageClose = $('mortgageClose');
+  if (buildBtn)    buildBtn.addEventListener('click',    () => { renderMortgagePanel(); openModal('mortgageBuildPanel'); });
+  if (mortgageBtn) mortgageBtn.addEventListener('click', () => { renderMortgagePanel(); openModal('mortgageBuildPanel'); });
+  if (mortgageClose) mortgageClose.addEventListener('click', () => closeModal('mortgageBuildPanel'));
+
+  const tradeBtn    = $('tradeBtn');
+  const tradeCancel = $('tradeCancel');
+  const tradeSend   = $('tradeSend');
+  const tradeTarget = $('tradeTarget');
+  if (tradeBtn)    tradeBtn.addEventListener('click',    openTradeModal);
+  if (tradeCancel) tradeCancel.addEventListener('click', () => closeModal('tradeModal'));
+  if (tradeTarget) tradeTarget.addEventListener('change', renderTradeProps);
+  if (tradeSend) {
+    tradeSend.addEventListener('click', () => {
+      const targetId = tradeTarget ? tradeTarget.value : '';
+      if (!targetId) { showToast('Selecione um jogador.', 'error'); return; }
+      const offerProps   = Array.from(document.querySelectorAll('input[name="offer-prop"]:checked')).map((cb) => parseInt(cb.value, 10));
+      const requestProps = Array.from(document.querySelectorAll('input[name="request-prop"]:checked')).map((cb) => parseInt(cb.value, 10));
+      const offerMoney   = parseInt(($('tradeOfferMoney')   || {}).value || '0', 10) || 0;
+      const requestMoney = parseInt(($('tradeRequestMoney') || {}).value || '0', 10) || 0;
+      socket.emit('proposeTrade', { targetPlayerId: targetId, offerProps, offerMoney, requestProps, requestMoney });
+      closeModal('tradeModal');
+    });
+  }
+
+  // Declare bankruptcy
+  (function () {
+    const ab = $('actionBar');
+    if (!ab || $('bankruptBtn')) return;
+    const btn = document.createElement('button');
+    btn.id = 'bankruptBtn';
+    btn.className = 'btn btn-danger col-span-2 text-sm';
+    btn.textContent = '💀 Declarar Falência';
+    btn.addEventListener('click', () => {
+      if (confirm('Tem certeza que deseja declarar falência? Esta ação é irreversível.')) {
+        socket.emit('declareBankrupt');
+      }
+    });
+    ab.appendChild(btn);
+  })();
+
+  /* =========================================================================
+   * Inicialização
+   * ========================================================================= */
+  try {
+    mySessionId = localStorage.getItem('mb_session');
+    if (!mySessionId) {
+      mySessionId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
+      localStorage.setItem('mb_session', mySessionId);
+    }
+    const savedNick = localStorage.getItem('mb_nick');
+    if (savedNick) {
+      myNickname = savedNick;
+      const ni = $('nicknameInput');
+      if (ni) ni.value = savedNick;
+    }
+  } catch(e) {}
+
+  showScreen('nicknameScreen');
+
+})();
