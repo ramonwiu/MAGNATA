@@ -88,6 +88,10 @@
   // Decisão de compra pendente para mostrar após animação terminar
   let pendingBuyAfterAnim = null;
 
+  // ═══ MODO PASSO A PASSO: jogador clica para avançar o peão uma casa por vez ═══
+  let manualStepMode = false;
+  let stepCallback = null;
+
   /* =========================================================================
    * Socket
    * ========================================================================= */
@@ -597,8 +601,8 @@
     // Oculta peão original temporariamente
     pawnEl.style.opacity = '0';
 
-    // Animação de arco parabólico (190ms)
-    const duration = 190;
+    // Animação de arco parabólico (300ms por casa para visibilidade)
+    const duration = 300;
     const startTime = Date.now();
     const deltaX = toX - fromX;
     const deltaY = toY - fromY;
@@ -644,8 +648,31 @@
     requestAnimationFrame(animateFrame);
   }
 
+  // ── Helpers para o modo passo a passo ──
+  function showStepButton(callback) {
+    stepCallback = callback;
+    const controls = $('stepControls');
+    const btn = $('stepForwardBtn');
+    if (btn) btn.disabled = false;
+    if (controls) controls.classList.remove('hidden');
+  }
+
+  function hideStepButton() {
+    stepCallback = null;
+    const controls = $('stepControls');
+    if (controls) controls.classList.add('hidden');
+  }
+
+  function updateStepProgress(current, total) {
+    const el = $('stepProgress');
+    if (el) el.textContent = `Casa ${current} de ${total}`;
+  }
+
   /**
    * CUTSCENE COMPLETA: Peão pulando casa por casa
+   * Em modo automático: pula todas as casas com pequeno delay entre cada uma.
+   * Em modo passo a passo (apenas para o jogador local): espera o clique do
+   * jogador no botão "Próxima Casa" para avançar cada casa.
    */
   function animatePawnStepsCutscene(playerId, oldPos, newPos, color, nickname, onDone) {
     isAnimatingCutscene = true;
@@ -655,12 +682,12 @@
     // Calcula o caminho (pode passar pelo GO = 0)
     let steps = newPos - oldPos;
     if (steps < 0) steps += 40;
-    if (steps === 0) { 
+    if (steps === 0) {
       isAnimatingCutscene = false;
-      animatingPawn = false; 
+      animatingPawn = false;
       applyCameraDynamics(false);
-      onDone && onDone(); 
-      return; 
+      onDone && onDone();
+      return;
     }
 
     const path = [];
@@ -669,37 +696,60 @@
     }
 
     let stepIndex = 0;
+    // Modo manual só se for o peão do jogador local
+    const useManual = manualStepMode && playerId === myPlayerId;
+
+    function finishAnimation() {
+      applyCameraDynamics(false);
+      isAnimatingCutscene = false;
+      animatingPawn = false;
+      hideStepButton();
+      onDone && onDone();
+    }
 
     function moveOneStep() {
       if (stepIndex >= path.length) {
-        applyCameraDynamics(false);
-        isAnimatingCutscene = false;
-        animatingPawn = false;
-        onDone && onDone();
+        finishAnimation();
         return;
       }
-      
+
       const currentPos = stepIndex === 0 ? oldPos : path[stepIndex - 1];
-      const nextPos = path[stepIndex];
+      const nextSpace = path[stepIndex];
       stepIndex++;
+      updateStepProgress(stepIndex, path.length);
 
       // Sons de passos crescentes
       SoundEffects.stepPop(stepIndex);
 
       // Renderiza peão na posição atual
       const pawnEl = renderSinglePawn(playerId, currentPos, color, nickname, false);
-      
+
       // Anima arco até próxima posição
-      animatePawnJumpArc(pawnEl, currentPos, nextPos, () => {
-        renderSinglePawn(playerId, nextPos, color, nickname, false);
-        renderedPositions[playerId] = nextPos;
-        setTimeout(moveOneStep, 20); // Pequeno delay entre pulos
+      animatePawnJumpArc(pawnEl, currentPos, nextSpace, () => {
+        renderSinglePawn(playerId, nextSpace, color, nickname, false);
+        renderedPositions[playerId] = nextSpace;
+
+        if (useManual && stepIndex < path.length) {
+          // Modo passo a passo: espera o jogador clicar
+          showStepButton(() => moveOneStep());
+        } else {
+          // Modo automático: continua após delay
+          setTimeout(moveOneStep, 80);
+        }
       });
     }
 
     // Remove peão da posição inicial
     removePawnFromAllSpaces(playerId);
-    setTimeout(moveOneStep, 100);
+
+    if (useManual) {
+      // Modo passo a passo: mostra o botão e espera o primeiro clique
+      updateStepProgress(0, path.length);
+      showStepButton(() => moveOneStep());
+    } else {
+      // Modo automático: inicia após pequeno delay
+      setTimeout(moveOneStep, 200);
+    }
   }
 
   // Helper para remover peão de todas as casas
@@ -902,7 +952,6 @@
     const buildBtn    = $('buildBtn');
     const mortgageBtn = $('mortgageBtn');
     const tradeBtn    = $('tradeBtn');
-    const endTurnBtn  = $('endTurnBtn');
     if (!actionBar) return;
 
     const isMyTurn = gs.players &&
@@ -920,7 +969,6 @@
         rollBtn.disabled = !canRoll;
         rollBtn.classList.toggle('hidden', myPlayer.inJail);
       }
-      if (endTurnBtn) endTurnBtn.disabled = phase !== TURN_PHASE.TURN_ACTIONS;
       if (buildBtn)    buildBtn.disabled    = false;
       if (mortgageBtn) mortgageBtn.disabled = false;
       if (tradeBtn)    tradeBtn.disabled    = false;
@@ -936,6 +984,7 @@
       }
     } else {
       actionBar.classList.add('hidden');
+      actionBar.style.display = 'none';
       if (jailControls) jailControls.classList.add('hidden');
     }
   }
@@ -948,15 +997,47 @@
     if (!el || !gs.players) return;
     const cur = gs.players[gs.currentPlayerIndex];
     if (!cur) { el.textContent = 'Aguardando...'; return; }
-    const phaseMap = {
-      [TURN_PHASE.WAITING_ROLL]:           'rolar os dados',
-      [TURN_PHASE.WAITING_BUY_DECISION]:   'decidir compra',
-      [TURN_PHASE.TURN_ACTIONS]:           'encerrar turno',
-      [TURN_PHASE.BANKRUPTCY_RESOLUTION]:  'resolver falência'
-    };
-    el.innerHTML =
-      `<span style="color:${playerColor(cur.color)};font-weight:900;">${cur.nickname}</span>` +
-      ` &mdash; ${phaseMap[gs.turnPhase] || ''}`;
+    const isMyTurn = cur.id === myPlayerId;
+    if (isMyTurn) {
+      let action = '';
+      if (cur.inJail && gs.turnPhase === TURN_PHASE.WAITING_ROLL) {
+        action = 'Pague a fiança, use Habeas Corpus ou role para sair da Delegacia';
+      } else if (gs.turnPhase === TURN_PHASE.WAITING_ROLL) {
+        action = 'Role os dados para começar sua vez';
+      } else if (gs.turnPhase === TURN_PHASE.WAITING_BUY_DECISION) {
+        action = 'Decida: comprar ou passar?';
+      } else if (gs.turnPhase === TURN_PHASE.TURN_ACTIONS) {
+        action = 'Encerrando turno...';
+      } else if (gs.turnPhase === TURN_PHASE.BANKRUPTCY_RESOLUTION) {
+        action = 'Você está insolvente! Hipoteque imóveis ou declare falência';
+      }
+      el.innerHTML = `<span style="color:${playerColor(cur.color)};font-weight:900;">Sua vez</span> &mdash; ${action}`;
+    } else {
+      const phaseMap = {
+        [TURN_PHASE.WAITING_ROLL]:           'rolar os dados',
+        [TURN_PHASE.WAITING_BUY_DECISION]:   'decidindo compra',
+        [TURN_PHASE.TURN_ACTIONS]:           'encerrando turno',
+        [TURN_PHASE.BANKRUPTCY_RESOLUTION]:  'resolver falência'
+      };
+      el.innerHTML =
+        `<span style="color:${playerColor(cur.color)};font-weight:900;">${cur.nickname}</span>` +
+        ` &mdash; ${phaseMap[gs.turnPhase] || ''}`;
+    }
+  }
+
+  /* =========================================================================
+   * tryAutoEndTurn – encerra o turno automaticamente quando não há ações
+   * obrigatórias pendentes (sem botão). O jogador apenas rola os dados e
+   * decide compras; o turno avança sozinho.
+   * ========================================================================= */
+  function tryAutoEndTurn() {
+    const gs = lastGameState;
+    if (!gs || !gs.players || gs.gameOver) return;
+    const isMyTurn = gs.players[gs.currentPlayerIndex] &&
+                     gs.players[gs.currentPlayerIndex].id === myPlayerId;
+    if (isMyTurn && gs.turnPhase === TURN_PHASE.TURN_ACTIONS && !gs.pendingDecision) {
+      socket.emit('endTurn');
+    }
   }
 
   /* =========================================================================
@@ -1032,6 +1113,9 @@
               showBuyDecision(pendingBuyAfterAnim);
               pendingBuyAfterAnim = null;
             }
+            // Auto-encerrar turno se o jogador terminou de mover e não há
+            // decisões obrigatórias pendentes (sem botão de encerrar).
+            tryAutoEndTurn();
           });
         }
       }
@@ -1530,11 +1614,22 @@
         }
       }
     }
+    // Animar dados se houve nova jogada (ANTES de applyGameState atualizar lastGameState,
+    // senão a comparação sempre dá igual e a animação nunca dispara).
+    if (gs.lastRoll && gs.dice) {
+      const prevDice = lastGameState ? lastGameState.dice : null;
+      if (!prevDice || prevDice[0] !== gs.dice[0] || prevDice[1] !== gs.dice[1]) {
+        animateDiceThrowCutscene(gs.dice[0], gs.dice[1], null);
+      }
+    }
     applyGameState(gs);
     if (gs.turnPhase !== TURN_PHASE.WAITING_BUY_DECISION) closeModal('deedModal');
     // Atualizar painel de hipoteca aberto
     const panel = $('mortgageBuildPanel');
     if (panel && panel.classList.contains('open')) renderMortgagePanel();
+    // Auto-encerrar turno: se não há ações obrigatórias pendentes e não estamos
+    // animando o peão, o turno avança automaticamente (sem botão).
+    if (!animatingPawn) tryAutoEndTurn();
   });
 
   socket.on('gameOver', (data) => {
@@ -1651,29 +1746,31 @@
     });
   }
 
-  // Intercepta o gameState para animar os dados com o resultado do servidor
-  socket.on('gameState', (gs) => {
-    if (gs.lastRoll && gs.dice) {
-      const prevDice = lastGameState ? lastGameState.dice : null;
-      if (!prevDice || prevDice[0] !== gs.dice[0] || prevDice[1] !== gs.dice[1]) {
-        animateDiceThrowCutscene(gs.dice[0], gs.dice[1], null);
-      }
-    }
-    const rollBtn2 = $('rollDiceBtn');
-    if (rollBtn2) rollBtn2.disabled = false;
-  });
+  // ── Modo passo a passo: botão "Próxima Casa" e toggle ──
+  const stepForwardBtn = $('stepForwardBtn');
+  if (stepForwardBtn) {
+    stepForwardBtn.addEventListener('click', () => {
+      const cb = stepCallback;
+      stepCallback = null;
+      if (stepForwardBtn) stepForwardBtn.disabled = true;
+      if (cb) cb();
+    });
+  }
 
-  // End turn
-  (function () {
-    const ab = $('actionBar');
-    if (!ab || $('endTurnBtn')) return;
-    const btn = document.createElement('button');
-    btn.id = 'endTurnBtn';
-    btn.className = 'btn btn-ghost col-span-2 flex items-center justify-center gap-2';
-    btn.innerHTML = '<i class="fa-solid fa-check"></i> Encerrar Turno';
-    btn.addEventListener('click', () => socket.emit('endTurn'));
-    ab.appendChild(btn);
-  })();
+  const manualToggle = $('manualModeToggle');
+  if (manualToggle) {
+    manualToggle.addEventListener('click', () => {
+      manualStepMode = !manualStepMode;
+      try { localStorage.setItem('mb_manual_step', manualStepMode ? '1' : '0'); } catch(e) {}
+      const label = $('manualModeLabel');
+      if (label) label.textContent = 'Passo a passo: ' + (manualStepMode ? 'ON' : 'OFF');
+      manualToggle.style.background = manualStepMode
+        ? 'linear-gradient(145deg,#f59e0b,#d97706)'
+        : '';
+      manualToggle.style.color = manualStepMode ? '#1f1300' : '';
+      showToast(manualStepMode ? 'Modo passo a passo ativado' : 'Modo passo a passo desativado', 'info');
+    });
+  }
 
   const jailPayBtn  = $('jailPayBtn');
   const jailCardBtn = $('jailCardBtn');
@@ -1742,6 +1839,15 @@
       myNickname = savedNick;
       const ni = $('nicknameInput');
       if (ni) ni.value = savedNick;
+    }
+    // Carregar preferência de modo passo a passo
+    manualStepMode = localStorage.getItem('mb_manual_step') === '1';
+    const ml = $('manualModeLabel');
+    if (ml) ml.textContent = 'Passo a passo: ' + (manualStepMode ? 'ON' : 'OFF');
+    const mt = $('manualModeToggle');
+    if (mt && manualStepMode) {
+      mt.style.background = 'linear-gradient(145deg,#f59e0b,#d97706)';
+      mt.style.color = '#1f1300';
     }
   } catch(e) {}
 

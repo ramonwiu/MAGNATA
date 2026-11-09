@@ -1165,6 +1165,19 @@
             </div>
           </div>
 
+          <!-- Controles de movimento passo a passo -->
+          <div id="stepControls" class="hidden" style="z-index:1;display:flex;flex-direction:column;align-items:center;gap:4px;">
+            <button id="stepForwardBtn" class="btn btn-primary" style="padding:8px 18px;font-size:14px;">
+              <i class="fa-solid fa-forward-step"></i> Próxima Casa
+            </button>
+            <span id="stepProgress" class="text-xs text-emerald-200 font-semibold"></span>
+          </div>
+
+          <!-- Toggle do modo passo a passo -->
+          <button id="manualModeToggle" class="btn btn-ghost" style="z-index:1;padding:4px 12px;font-size:11px;">
+            <i class="fa-solid fa-shoe-prints"></i> <span id="manualModeLabel">Passo a passo: OFF</span>
+          </button>
+
           <!-- floating money over the board center -->
           <div id="floatingMoney" class="floating-layer"></div>
         </div>

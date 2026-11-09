@@ -1158,6 +1158,9 @@ io.on('connection', (socket) => {
     const ctx = getGameAndPlayer(socket.id);
     if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
     const { room, gs, gp } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
     if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
     const spaceIndex = payload && parseInt(payload.spaceIndex, 10);
     const action = payload && payload.action;
@@ -1201,6 +1204,12 @@ io.on('connection', (socket) => {
     } else {
       socket.emit('error', { message: 'Ação de construção inválida.' }); return;
     }
+    // Recuperação de falência: se o jogador saiu da insolvência hipotecando/vendendo
+    if (gs.turnPhase === TURN_PHASE.BANKRUPTCY_RESOLUTION && gp.balance >= 0) {
+      gs.turnPhase = TURN_PHASE.TURN_ACTIONS;
+      gs.pendingDecision = null;
+      logMsg(gs, `${gp.nickname} recuperou o saldo e pode continuar.`);
+    }
     broadcastGameState(room.id);
   });
 
@@ -1212,6 +1221,9 @@ io.on('connection', (socket) => {
     const ctx = getGameAndPlayer(socket.id);
     if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
     const { room, gs, gp } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
     if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
     const spaceIndex = payload && parseInt(payload.spaceIndex, 10);
     const action = payload && payload.action;
@@ -1237,6 +1249,12 @@ io.on('connection', (socket) => {
     } else {
       socket.emit('error', { message: 'Ação de hipoteca inválida.' }); return;
     }
+    // Recuperação de falência: se o jogador saiu da insolvência hipotecando
+    if (gs.turnPhase === TURN_PHASE.BANKRUPTCY_RESOLUTION && gp.balance >= 0) {
+      gs.turnPhase = TURN_PHASE.TURN_ACTIONS;
+      gs.pendingDecision = null;
+      logMsg(gs, `${gp.nickname} recuperou o saldo e pode continuar.`);
+    }
     broadcastGameState(room.id);
   });
 
@@ -1248,6 +1266,9 @@ io.on('connection', (socket) => {
     const ctx = getGameAndPlayer(socket.id);
     if (!ctx) { socket.emit('error', { message: 'Sem partida ativa.' }); return; }
     const { room, gs, gp } = ctx;
+    if (!isCurrentPlayer(gs, gp.id)) {
+      socket.emit('error', { message: 'Não é sua vez.' }); return;
+    }
     if (gs.gameOver) { socket.emit('error', { message: 'Partida encerrada.' }); return; }
     const p = payload || {};
     const target = gs.players.find((x) => x.id === p.targetPlayerId && !x.bankrupt);
