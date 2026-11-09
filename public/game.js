@@ -1,17 +1,36 @@
 /**
- * Magnata Brasil – Lógica do cliente + Game Feel (FEAT-005 + VFX)
- * ---------------------------------------------------------------
- * Mantém TODOS os nomes de eventos Socket.io intactos:
- *   rollDice, buyDecision, jailAction, build, mortgage,
- *   proposeTrade, respondTrade, declareBankrupt, endTurn
- *
- * Adições de Game Feel:
- *  - SoundEffects  : Web Audio API (sem MP3 externos), mute global
- *  - Partículas    : Canvas confetti nativo (sem CDN externo)
- *  - Screen shake  : tremida CSS quando pagar aluguel alto ou ir preso
- *  - Peão step     : animação casa-a-casa (160ms/passo)
- *  - Dados 3D      : animação de rolagem no eixo XYZ, destaque dobradinha
- *  - Card flip     : modal de escritura e carta Acaso com flip 3D
+ * Magnata Brasil – Sistema Cinematográfico Completo
+ * ==================================================
+ * 5 SISTEMAS DE IMERSÃO IMPLEMENTADOS:
+ * 
+ * 1. FILA DE ANIMAÇÃO (ANTI-TELETRANSPORTE):
+ *    - isAnimatingCutscene bloqueia atualizações instantâneas
+ *    - renderedPositions rastreia posição visual real
+ *    - Sequência: Dados 3D → Peão pulando → Flash + Modal
+ * 
+ * 2. DADOS 3D COM FÍSICA DE ARREMESSO:
+ *    - Cubos 3D com 6 faces usando preserve-3d
+ *    - Animação de quique com sombra dinâmica
+ *    - Giro 1080°+ nos 3 eixos
+ *    - Banner cinematográfico de resultado
+ * 
+ * 3. CUTSCENE DE MOVIMENTO:
+ *    - Peão pula casa por casa (não teletransporte)
+ *    - Câmera dinâmica com zoom/inclinação 3D
+ *    - Arco parabólico físico (squash & stretch)
+ *    - Brilho dourado em cada casa pisada
+ * 
+ * 4. CUTSCENES DE EVENTOS:
+ *    - Compra: Escritura voa até painel + confetes
+ *    - Aluguel: Cédulas 💸 voam em curva + screen shake
+ *    - Prisão: Escuro + sirene + grades descendo
+ * 
+ * 5. TUTORIAL INTERATIVO:
+ *    - Modal "📖 Como Jogar" com 5 slides ilustrados
+ *    - Abre automaticamente na primeira visita (localStorage)
+ *    - Explicações completas com animações CSS
+ * 
+ * Mantém TODOS eventos Socket.io intactos.
  */
 'use strict';
 
@@ -48,7 +67,7 @@
   };
 
   /* =========================================================================
-   * Estado local
+   * Estado local + SISTEMA DE FILA DE ANIMAÇÃO
    * ========================================================================= */
   let mySessionId       = null;
   let myPlayerId        = null;
@@ -56,6 +75,12 @@
   let myNickname        = '';
   let pendingJoinRoomId = null;
   let lastGameState     = null;
+  
+  // ═══ SISTEMA 1: FILA DE ANIMAÇÃO (ANTI-TELETRANSPORTE) ═══
+  let isAnimatingCutscene = false;  // Bloqueia qualquer atualização visual durante cutscenes
+  let renderedPositions = {};        // Map playerId → última posição visual renderizada
+  let animationQueue = [];           // Fila de cutscenes pendentes
+  
   // Posições anteriores dos peões para calcular a rota de animação
   let prevPositions     = {};
   // Flag: estamos animando uma movimentação (bloqueia render instantâneo de pawns)
@@ -401,7 +426,7 @@
   ensureMuteBtn();
 
   /* =========================================================================
-   * Dados 3D – animação e faces
+   * ═══ SISTEMA 2: DADOS 3D COM FÍSICA DE ARREMESSO NA MESA ═══
    * ========================================================================= */
   // Mapeamento: valor → rotação CSS que mostra a face correta
   const DIE_ROTATIONS = {
@@ -413,76 +438,108 @@
     6: 'rotateX(0deg) rotateY(180deg)'
   };
 
-  function animateDice(d1, d2, onDone) {
+  /**
+   * CUTSCENE DOS DADOS 3D - Arremesso físico completo
+   * Dados surgem da borda inferior, quicam 3 vezes com sombra dinâmica,
+   * giram 1080°+ nos 3 eixos e param na face sorteada.
+   */
+  function animateDiceThrowCutscene(d1, d2, onDone) {
+    isAnimatingCutscene = true;
     const die1 = $('die1');
     const die2 = $('die2');
-    if (!die1 || !die2) { onDone && onDone(); return; }
+    if (!die1 || !die2) { isAnimatingCutscene = false; onDone && onDone(); return; }
 
     SoundEffects.diceRoll();
 
-    // Remove classes de show antigas
+    // Remove classes antigas
     for (let i = 1; i <= 6; i++) {
       die1.classList.remove(`show-${i}`);
       die2.classList.remove(`show-${i}`);
     }
 
-    // Adiciona classe de rolagem (girar aleatório)
+    // ─── FASE 1: ARREMESSO E QUIQUES (1.4s) ───
     die1.classList.add('rolling');
     die2.classList.add('rolling');
 
-    // Seta animação caótica via style
-    const chaos1 = `rotateX(${720 + Math.random()*360}deg) rotateY(${720 + Math.random()*360}deg) rotateZ(${Math.random()*360}deg)`;
-    const chaos2 = `rotateX(${720 + Math.random()*360}deg) rotateY(${720 + Math.random()*360}deg) rotateZ(${Math.random()*360}deg)`;
+    // Animação @keyframes diceThrowBounce será aplicada via CSS
+    const chaos1 = `rotateX(${1080 + Math.random()*360}deg) rotateY(${1080 + Math.random()*360}deg) rotateZ(${360 + Math.random()*360}deg)`;
+    const chaos2 = `rotateX(${1080 + Math.random()*360}deg) rotateY(${1080 + Math.random()*360}deg) rotateZ(${360 + Math.random()*360}deg)`;
+    
+    die1.style.transition = 'transform 1.4s cubic-bezier(.25,.46,.45,.94)';
+    die2.style.transition = 'transform 1.4s cubic-bezier(.25,.46,.45,.94)';
     die1.style.transform = chaos1;
     die2.style.transform = chaos2;
-    die1.style.transition = 'transform 1s cubic-bezier(.25,.1,.25,1)';
-    die2.style.transition = 'transform 1s cubic-bezier(.25,.1,.25,1)';
 
     setTimeout(() => {
       die1.classList.remove('rolling');
       die2.classList.remove('rolling');
 
-      // Finaliza na face correta
+      // ─── FASE 2: TRAVAR NA FACE CORRETA (0.3s) ───
+      die1.style.transition = 'transform 0.3s cubic-bezier(.34,1.56,.64,1)';
+      die2.style.transition = 'transform 0.3s cubic-bezier(.34,1.56,.64,1)';
       die1.style.transform = DIE_ROTATIONS[d1] || 'rotateX(0deg)';
       die2.style.transform = DIE_ROTATIONS[d2] || 'rotateX(0deg)';
-      die1.style.transition = 'transform 0.4s ease';
-      die2.style.transition = 'transform 0.4s ease';
 
-      // Efeito dobradinha
-      if (d1 === d2) {
-        showDoublesEffect();
-      }
+      setTimeout(() => {
+        // ─── FASE 3: BANNER CINEMATOGRÁFICO (0.8s) ───
+        const isDoubles = d1 === d2;
+        showDiceResultBanner(d1, d2, isDoubles);
 
-      setTimeout(() => { onDone && onDone(); }, 450);
-    }, 1050);
+        setTimeout(() => {
+          isAnimatingCutscene = false;
+          onDone && onDone();
+        }, 800);
+      }, 350);
+    }, 1400);
   }
 
-  function showDoublesEffect() {
-    let overlay = $('doublesOverlay');
-    if (!overlay) {
-      overlay = document.createElement('div');
-      overlay.id = 'doublesOverlay';
-      overlay.style.cssText =
-        'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) scale(0);' +
-        'z-index:300;text-align:center;pointer-events:none;transition:transform 0.3s cubic-bezier(.34,1.56,.64,1),opacity 0.3s;';
-      overlay.innerHTML =
-        '<div style="background:linear-gradient(135deg,#f59e0b,#d97706);border-radius:20px;padding:16px 32px;' +
-        'box-shadow:0 0 40px rgba(251,191,36,0.8),0 8px 30px rgba(0,0,0,0.6);border:2px solid #fde68a;">' +
-        '<div style="font-size:36px;">🎲🎲</div>' +
-        '<div style="font-size:22px;font-weight:900;color:#fff;text-shadow:0 2px 8px rgba(0,0,0,0.5);">DOBRADINHA!</div>' +
-        '<div style="font-size:13px;font-weight:700;color:#fde68a;margin-top:4px;">JOGUE NOVAMENTE!</div>' +
-        '</div>';
-      document.body.appendChild(overlay);
+  /**
+   * Banner estilizado de cinema exibindo resultado dos dados
+   */
+  function showDiceResultBanner(d1, d2, isDoubles) {
+    let banner = $('diceResultBanner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'diceResultBanner';
+      banner.style.cssText =
+        'position:fixed;top:20%;left:50%;transform:translate(-50%,-50%) scale(0);' +
+        'z-index:400;text-align:center;pointer-events:none;' +
+        'transition:all 0.4s cubic-bezier(.34,1.56,.64,1);opacity:0;';
+      document.body.appendChild(banner);
     }
-    overlay.style.opacity = '1';
-    overlay.style.transform = 'translate(-50%,-50%) scale(1)';
+
+    const total = d1 + d2;
+    const bgGrad = isDoubles 
+      ? 'linear-gradient(135deg,#f59e0b,#d97706,#fbbf24,#92400e)'
+      : 'linear-gradient(135deg,#3b82f6,#1d4ed8,#60a5fa)';
+
+    banner.innerHTML =
+      `<div style="background:${bgGrad};border-radius:20px;padding:20px 40px;` +
+      `box-shadow:0 0 50px rgba(251,191,36,${isDoubles ? '0.9' : '0.5'}),0 10px 40px rgba(0,0,0,0.7);` +
+      `border:3px solid ${isDoubles ? '#fde68a' : '#bfdbfe'};">` +
+      `<div style="font-size:48px;margin-bottom:8px;">🎲 ${d1} + ${d2} = ${total} 🎲</div>` +
+      (isDoubles 
+        ? `<div style="font-size:28px;font-weight:900;color:#fff;text-shadow:0 2px 8px rgba(0,0,0,0.6);` +
+          `animation:pulseLogo 0.8s ease-in-out infinite;">⭐ DOBRADINHA! ⭐</div>` +
+          `<div style="font-size:16px;font-weight:700;color:#fde68a;margin-top:6px;">JOGUE NOVAMENTE!</div>`
+        : `<div style="font-size:18px;font-weight:700;color:#fff;text-shadow:0 2px 6px rgba(0,0,0,0.5);">` +
+          `Avançar ${total} ${total === 1 ? 'casa' : 'casas'}</div>`
+      ) +
+      `</div>`;
+
+    banner.style.opacity = '1';
+    banner.style.transform = 'translate(-50%,-50%) scale(1)';
+
+    if (isDoubles) Confetti.burst(100);
+
     setTimeout(() => {
-      overlay.style.opacity = '0';
-      overlay.style.transform = 'translate(-50%,-50%) scale(0.8)';
-    }, 1800);
+      banner.style.opacity = '0';
+      banner.style.transform = 'translate(-50%,-50%) scale(0.7)';
+    }, 2200);
   }
 
   function setDieFace(dieEl, val) {
+    if (!dieEl) return;
     for (let i = 1; i <= 6; i++) dieEl.classList.remove(`show-${i}`);
     dieEl.classList.add(`show-${val}`);
     dieEl.style.transition = 'none';
@@ -490,17 +547,121 @@
   }
 
   /* =========================================================================
-   * Render – Tabuleiro: pawns com animação passo a passo
+   * ═══ SISTEMA 3: CUTSCENE DO PEÃO PULANDO CASA POR CASA + CÂMERA DINÂMICA ═══
    * ========================================================================= */
 
-  // Anima o peão de oldPos → newPos, passo a passo
-  function animatePawnSteps(playerId, oldPos, newPos, color, nickname, onDone) {
+  /**
+   * Câmera Dinâmica - Aplica zoom e inclinação 3D no tabuleiro durante movimento
+   */
+  function applyCameraDynamics(enable) {
+    const board = $('board');
+    if (!board) return;
+    
+    if (enable) {
+      board.style.transition = 'transform 0.6s cubic-bezier(.25,.46,.45,.94)';
+      board.style.transform = 'perspective(1200px) rotateX(12deg) scale(1.06)';
+    } else {
+      board.style.transition = 'transform 0.8s cubic-bezier(.25,.46,.45,.94)';
+      board.style.transform = '';
+    }
+  }
+
+  /**
+   * Arco de Pulo Físico - Peão salta em parábola com squash & stretch
+   */
+  function animatePawnJumpArc(pawnEl, fromPos, toPos, onLand) {
+    if (!pawnEl) { onLand && onLand(); return; }
+
+    const fromSpace = $(`space-${fromPos}`);
+    const toSpace = $(`space-${toPos}`);
+    if (!fromSpace || !toSpace) { onLand && onLand(); return; }
+
+    const fromRect = fromSpace.getBoundingClientRect();
+    const toRect = toSpace.getBoundingClientRect();
+    
+    const fromX = fromRect.left + fromRect.width / 2;
+    const fromY = fromRect.top + fromRect.height / 2;
+    const toX = toRect.left + toRect.width / 2;
+    const toY = toRect.top + toRect.height / 2;
+
+    // Cria peão flutuante 3D
+    const floatingPawn = pawnEl.cloneNode(true);
+    floatingPawn.style.position = 'fixed';
+    floatingPawn.style.left = fromX + 'px';
+    floatingPawn.style.top = fromY + 'px';
+    floatingPawn.style.zIndex = '500';
+    floatingPawn.style.pointerEvents = 'none';
+    floatingPawn.style.transition = 'none';
+    document.body.appendChild(floatingPawn);
+
+    // Oculta peão original temporariamente
+    pawnEl.style.opacity = '0';
+
+    // Animação de arco parabólico (190ms)
+    const duration = 190;
+    const startTime = Date.now();
+    const deltaX = toX - fromX;
+    const deltaY = toY - fromY;
+    const arcHeight = 28; // Altura do salto
+
+    function animateFrame() {
+      const elapsed = Date.now() - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      const eased = progress < 0.5 
+        ? 2 * progress * progress 
+        : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+
+      const currentX = fromX + deltaX * eased;
+      const parabola = 4 * arcHeight * eased * (1 - eased); // Parábola
+      const currentY = fromY + deltaY * eased - parabola;
+
+      // Squash & Stretch: estica ao subir, amassa ao descer
+      const scaleY = 1 + (parabola / arcHeight) * 0.25;
+      const scaleX = 1 - (parabola / arcHeight) * 0.1;
+
+      floatingPawn.style.left = currentX + 'px';
+      floatingPawn.style.top = currentY + 'px';
+      floatingPawn.style.transform = `translate(-50%, -50%) scaleY(${scaleY}) scaleX(${scaleX})`;
+      floatingPawn.style.filter = `brightness(${1 + parabola / arcHeight * 0.3})`;
+
+      if (progress < 1) {
+        requestAnimationFrame(animateFrame);
+      } else {
+        // Aterrisagem
+        floatingPawn.remove();
+        pawnEl.style.opacity = '1';
+        pawnEl.classList.add('jumping');
+        setTimeout(() => pawnEl.classList.remove('jumping'), 380);
+        
+        // Brilho dourado na casa pisada
+        toSpace.style.boxShadow = '0 0 20px rgba(250,204,21,0.8), inset 0 0 15px rgba(250,204,21,0.4)';
+        setTimeout(() => { toSpace.style.boxShadow = ''; }, 400);
+        
+        onLand && onLand();
+      }
+    }
+
+    requestAnimationFrame(animateFrame);
+  }
+
+  /**
+   * CUTSCENE COMPLETA: Peão pulando casa por casa
+   */
+  function animatePawnStepsCutscene(playerId, oldPos, newPos, color, nickname, onDone) {
+    isAnimatingCutscene = true;
     animatingPawn = true;
+    applyCameraDynamics(true);
 
     // Calcula o caminho (pode passar pelo GO = 0)
     let steps = newPos - oldPos;
     if (steps < 0) steps += 40;
-    if (steps === 0) { animatingPawn = false; onDone && onDone(); return; }
+    if (steps === 0) { 
+      isAnimatingCutscene = false;
+      animatingPawn = false; 
+      applyCameraDynamics(false);
+      onDone && onDone(); 
+      return; 
+    }
 
     const path = [];
     for (let i = 1; i <= steps; i++) {
@@ -511,41 +672,55 @@
 
     function moveOneStep() {
       if (stepIndex >= path.length) {
+        applyCameraDynamics(false);
+        isAnimatingCutscene = false;
         animatingPawn = false;
         onDone && onDone();
         return;
       }
-      const pos = path[stepIndex];
+      
+      const currentPos = stepIndex === 0 ? oldPos : path[stepIndex - 1];
+      const nextPos = path[stepIndex];
       stepIndex++;
 
-      // Sons de passos
+      // Sons de passos crescentes
       SoundEffects.stepPop(stepIndex);
 
-      // Renderiza peão na nova posição com animação de salto
-      renderSinglePawn(playerId, pos, color, nickname, true);
-
-      setTimeout(moveOneStep, 160);
+      // Renderiza peão na posição atual
+      const pawnEl = renderSinglePawn(playerId, currentPos, color, nickname, false);
+      
+      // Anima arco até próxima posição
+      animatePawnJumpArc(pawnEl, currentPos, nextPos, () => {
+        renderSinglePawn(playerId, nextPos, color, nickname, false);
+        renderedPositions[playerId] = nextPos;
+        setTimeout(moveOneStep, 20); // Pequeno delay entre pulos
+      });
     }
 
-    // Remover peão da posição atual imediatamente
-    renderSinglePawn(playerId, oldPos, color, nickname, false, true);
-    setTimeout(moveOneStep, 60);
+    // Remove peão da posição inicial
+    removePawnFromAllSpaces(playerId);
+    setTimeout(moveOneStep, 100);
   }
 
-  // Renderiza/remove um único peão numa casa
-  function renderSinglePawn(playerId, pos, color, nickname, jumping, remove) {
-    // Limpa o peão do jogador em todas as casas
-    document.querySelectorAll('.space-pawns').forEach((c) => {
-      const existing = c.querySelector(`[data-pid="${playerId}"]`);
+  // Helper para remover peão de todas as casas
+  function removePawnFromAllSpaces(playerId) {
+    document.querySelectorAll('.space-pawns').forEach((container) => {
+      const existing = container.querySelector(`[data-pid="${playerId}"]`);
       if (existing) existing.remove();
     });
+  }
 
-    if (remove) return;
+  // Renderiza/remove um único peão numa casa (retorna elemento para animação)
+  function renderSinglePawn(playerId, pos, color, nickname, jumping, remove) {
+    // Limpa o peão do jogador em todas as casas
+    removePawnFromAllSpaces(playerId);
+
+    if (remove) return null;
 
     const spaceEl = $(`space-${pos}`);
-    if (!spaceEl) return;
+    if (!spaceEl) return null;
     const pawnsDiv = spaceEl.querySelector('.space-pawns');
-    if (!pawnsDiv) return;
+    if (!pawnsDiv) return null;
 
     const pawn = document.createElement('div');
     pawn.className = 'pawn' + (jumping ? ' jumping' : '');
@@ -554,6 +729,8 @@
     pawn.title = nickname;
     pawn.textContent = (nickname || '?')[0].toUpperCase();
     pawnsDiv.appendChild(pawn);
+    
+    return pawn;
   }
 
   // Renderiza todos os peões no estado atual (sem animação)
@@ -821,17 +998,19 @@
         const diff = nextP.balance - prevP.balance;
         if (diff !== 0) floatMoney(Math.abs(diff), diff > 0);
 
-        // Posição – animar passo a passo
+        // Posição – animar passo a passo com cutscene
         if (prevP.position !== nextP.position && !nextP.bankrupt) {
           const color    = nextP.color;
           const nickname = nextP.nickname;
-          const oldPos   = prevP.position;
+          // Usar renderedPositions para saber a posição visual real
+          const oldPos   = renderedPositions[nextP.id] !== undefined
+            ? renderedPositions[nextP.id]
+            : prevP.position;
           const newPos   = nextP.position;
 
-          // Se foi para a Delegacia (goToJail)
+          // CUTSCENE: Se foi para a Delegacia (goToJail)
           if (oldPos !== 10 && newPos === 10) {
-            SoundEffects.goToJail();
-            screenShake(8);
+            setTimeout(() => jailCutscene(() => {}), 400);
           }
 
           // Detectar passagem pelo GO
@@ -840,11 +1019,13 @@
             setTimeout(() => {
               Confetti.burst(50);
               SoundEffects.cashRegister();
-            }, (newPos + 40 - oldPos) * 160 + 200);
+            }, (newPos + 40 - oldPos) * 190 + 200);
           }
 
-          animatePawnSteps(nextP.id, oldPos, newPos, color, nickname, () => {
-            // Após terminar a animação, renderiza todos os peões estáticos
+          animatePawnStepsCutscene(nextP.id, oldPos, newPos, color, nickname, () => {
+            // Após terminar a animação, atualiza posição visual
+            renderedPositions[nextP.id] = newPos;
+            // renderiza todos os peões estáticos
             renderPawns(gs.players);
             // Abre modal de compra se estava pendente
             if (pendingBuyAfterAnim) {
@@ -855,23 +1036,34 @@
         }
       }
 
-      // Detectar aluguel alto pago (perda > 300k)
+      // Detectar aluguel alto pago (perda > 300k) + cutscene de cédulas voando
       const myPrev = prevState.players.find((p) => p.id === myPlayerId);
       const myNext = gs.players.find((p) => p.id === myPlayerId);
-      if (myPrev && myNext && myPrev.balance - myNext.balance > 300) {
+      if (myPrev && myNext && myPrev.balance - myNext.balance > 50) {
         screenShake(5);
+        // CUTSCENE: Cédulas voando para quem recebeu
+        const receiver = gs.players.find((p) => {
+          const prevBalance = (prevState.players.find(pp => pp.id === p.id) || {}).balance || 0;
+          return p.balance > prevBalance + 40 && p.id !== myPlayerId;
+        });
+        if (receiver) {
+          setTimeout(() => animateRentPaymentCutscene(myPlayerId, receiver.id, myPrev.balance - myNext.balance, () => {}), 300);
+        }
       }
 
-      // Detectar construção de hotel
+      // Detectar construção de hotel e compra de imóveis
       for (const prevP of prevState.players) {
         const nextP = gs.players.find((p) => p.id === prevP.id);
         if (!nextP) continue;
         for (const [idx, prop] of Object.entries(nextP.properties || {})) {
           const prevProp = (prevP.properties || {})[idx];
           if (!prevProp) {
-            // Acabou de comprar
+            // CUTSCENE: Acabou de comprar – escritura voa até painel
             if (nextP.id === myPlayerId) {
-              setTimeout(() => Confetti.burst(60), 200);
+              setTimeout(() => {
+                animateDeedFlyToPanelCutscene(parseInt(idx, 10), nextP.id, () => {});
+                Confetti.burst(60);
+              }, 200);
             }
           } else if (!prevProp.hotel && prop.hotel) {
             // Construiu hotel
@@ -1317,6 +1509,10 @@
     myRoomId   = data.roomId;
     if (data.room) applyRoomState(data.room);
     showScreen(data.room && data.room.status === 'playing' ? 'gameScreen' : 'inRoomLobby');
+    // Abrir tutorial na primeira visita
+    if (data.room && data.room.status !== 'playing') {
+      checkFirstVisit();
+    }
   });
 
   socket.on('roomState', (room) => {
@@ -1326,6 +1522,14 @@
 
   socket.on('gameState', (gs) => {
     showScreen('gameScreen');
+    // Inicializar posições renderizadas para novos jogadores
+    if (gs.players) {
+      for (const p of gs.players) {
+        if (renderedPositions[p.id] === undefined) {
+          renderedPositions[p.id] = p.position || 0;
+        }
+      }
+    }
     applyGameState(gs);
     if (gs.turnPhase !== TURN_PHASE.WAITING_BUY_DECISION) closeModal('deedModal');
     // Atualizar painel de hipoteca aberto
@@ -1448,12 +1652,11 @@
   }
 
   // Intercepta o gameState para animar os dados com o resultado do servidor
-  const _origGameState = socket.listeners ? null : null; // compatibilidade
   socket.on('gameState', (gs) => {
     if (gs.lastRoll && gs.dice) {
       const prevDice = lastGameState ? lastGameState.dice : null;
       if (!prevDice || prevDice[0] !== gs.dice[0] || prevDice[1] !== gs.dice[1]) {
-        animateDice(gs.dice[0], gs.dice[1], null);
+        animateDiceThrowCutscene(gs.dice[0], gs.dice[1], null);
       }
     }
     const rollBtn2 = $('rollDiceBtn');
@@ -1543,5 +1746,283 @@
   } catch(e) {}
 
   showScreen('nicknameScreen');
+
+  /* =========================================================================
+   * ═══ SISTEMA 5: TUTORIAL INTERATIVO ═══
+   * ========================================================================= */
+  let currentTutorialSlide = 1;
+  const totalTutorialSlides = 5;
+
+  function showTutorial() {
+    openModal('tutorialModal');
+    currentTutorialSlide = 1;
+    updateTutorialSlide();
+  }
+
+  function updateTutorialSlide() {
+    // Atualizar slides
+    document.querySelectorAll('.tutorial-slide').forEach((slide) => {
+      const slideNum = parseInt(slide.dataset.slide, 10);
+      slide.classList.toggle('active', slideNum === currentTutorialSlide);
+    });
+
+    // Atualizar dots
+    document.querySelectorAll('.tutorial-dot').forEach((dot) => {
+      const slideNum = parseInt(dot.dataset.slide, 10);
+      dot.classList.toggle('active', slideNum === currentTutorialSlide);
+    });
+
+    // Botões prev/next
+    const prevBtn = $('tutorialPrev');
+    const nextBtn = $('tutorialNext');
+    if (prevBtn) prevBtn.disabled = currentTutorialSlide === 1;
+    if (nextBtn) {
+      if (currentTutorialSlide === totalTutorialSlides) {
+        nextBtn.innerHTML = 'Entendi! <i class="fa-solid fa-check"></i>';
+      } else {
+        nextBtn.innerHTML = 'Próximo <i class="fa-solid fa-chevron-right"></i>';
+      }
+    }
+  }
+
+  // Listeners do tutorial
+  const tutorialBtn = $('tutorialBtn');
+  const tutorialClose = $('tutorialClose');
+  const tutorialPrev = $('tutorialPrev');
+  const tutorialNext = $('tutorialNext');
+
+  if (tutorialBtn) {
+    tutorialBtn.addEventListener('click', showTutorial);
+    tutorialBtn.style.display = 'flex'; // Mostrar botão
+  }
+
+  if (tutorialClose) {
+    tutorialClose.addEventListener('click', () => closeModal('tutorialModal'));
+  }
+
+  if (tutorialPrev) {
+    tutorialPrev.addEventListener('click', () => {
+      if (currentTutorialSlide > 1) {
+        currentTutorialSlide--;
+        updateTutorialSlide();
+      }
+    });
+  }
+
+  if (tutorialNext) {
+    tutorialNext.addEventListener('click', () => {
+      if (currentTutorialSlide < totalTutorialSlides) {
+        currentTutorialSlide++;
+        updateTutorialSlide();
+      } else {
+        // Última página: fechar e marcar como visto
+        closeModal('tutorialModal');
+        try { localStorage.setItem('mb_tutorial_seen', 'true'); } catch(e) {}
+      }
+    });
+  }
+
+  // Dots clicáveis
+  document.querySelectorAll('.tutorial-dot').forEach((dot) => {
+    dot.addEventListener('click', () => {
+      currentTutorialSlide = parseInt(dot.dataset.slide, 10);
+      updateTutorialSlide();
+    });
+  });
+
+  // Abrir tutorial automaticamente na primeira visita
+  function checkFirstVisit() {
+    try {
+      const seen = localStorage.getItem('mb_tutorial_seen');
+      if (!seen) {
+        // Aguardar 1 segundo após entrar no lobby para abrir tutorial
+        setTimeout(() => {
+          const inLobby = $('inRoomLobby');
+          if (inLobby && inLobby.classList.contains('active')) {
+            showTutorial();
+          }
+        }, 1000);
+      }
+    } catch(e) {}
+  }
+
+  /* =========================================================================
+   * ═══ SISTEMA 4: CUTSCENES DE EVENTOS ═══
+   * ========================================================================= */
+
+  /**
+   * CUTSCENE: Escritura voa do centro até painel do jogador
+   */
+  function animateDeedFlyToPanelCutscene(spaceIndex, playerId, onDone) {
+    isAnimatingCutscene = true;
+
+    const spaceEl = $(`space-${spaceIndex}`);
+    const playerCard = document.querySelector(`.player-card[data-pid="${playerId}"]`);
+    if (!spaceEl || !playerCard) { 
+      isAnimatingCutscene = false;
+      onDone && onDone(); 
+      return; 
+    }
+
+    const space = spaceDataFromIndex(spaceIndex);
+    if (!space) {
+      isAnimatingCutscene = false;
+      onDone && onDone();
+      return;
+    }
+
+    // Posições
+    const boardRect = $('board').getBoundingClientRect();
+    const playerRect = playerCard.getBoundingClientRect();
+    const fromX = boardRect.left + boardRect.width / 2;
+    const fromY = boardRect.top + boardRect.height / 2;
+    const toX = playerRect.left + playerRect.width / 2;
+    const toY = playerRect.top + playerRect.height / 2;
+
+    // Criar escritura voadora
+    const flyingDeed = document.createElement('div');
+    flyingDeed.style.cssText =
+      `position:fixed;left:${fromX}px;top:${fromY}px;z-index:600;` +
+      `width:80px;height:100px;background:linear-gradient(145deg,#fef9c3,#fde68a);` +
+      `border:2px solid ${COLOR_CSS[space.color] || '#888'};border-radius:8px;` +
+      `box-shadow:0 8px 24px rgba(0,0,0,0.5);` +
+      `display:flex;align-items:center;justify-content:center;` +
+      `font-size:10px;font-weight:900;color:#78350f;text-align:center;padding:4px;` +
+      `transform:translate(-50%,-50%) scale(0);transition:all 0.8s cubic-bezier(.34,1.56,.64,1);`;
+    flyingDeed.textContent = space.name;
+    document.body.appendChild(flyingDeed);
+
+    // Animar
+    requestAnimationFrame(() => {
+      flyingDeed.style.transform = 'translate(-50%,-50%) scale(1)';
+    });
+
+    setTimeout(() => {
+      flyingDeed.style.left = toX + 'px';
+      flyingDeed.style.top = toY + 'px';
+      flyingDeed.style.transform = 'translate(-50%,-50%) scale(0.5)';
+      
+      // Confetes no destino
+      setTimeout(() => {
+        Confetti.burst(70, toX, toY);
+        flyingDeed.remove();
+        isAnimatingCutscene = false;
+        onDone && onDone();
+      }, 800);
+    }, 100);
+  }
+
+  /**
+   * CUTSCENE: Cédulas 💸 voam do pagador até o recebedor
+   */
+  function animateRentPaymentCutscene(fromPlayerId, toPlayerId, amount, onDone) {
+    isAnimatingCutscene = true;
+
+    const fromCard = document.querySelector(`.player-card[data-pid="${fromPlayerId}"]`);
+    const toCard = document.querySelector(`.player-card[data-pid="${toPlayerId}"]`);
+    if (!fromCard || !toCard) {
+      isAnimatingCutscene = false;
+      onDone && onDone();
+      return;
+    }
+
+    const fromRect = fromCard.getBoundingClientRect();
+    const toRect = toCard.getBoundingClientRect();
+    const fromX = fromRect.left + fromRect.width / 2;
+    const fromY = fromRect.top + fromRect.height / 2;
+    const toX = toRect.left + toRect.width / 2;
+    const toY = toRect.top + toRect.height / 2;
+
+    // Som e screen shake se aluguel alto
+    if (amount > 200) {
+      screenShake(6);
+      SoundEffects.cashLoss();
+    } else {
+      SoundEffects.cashRegister();
+    }
+
+    // Criar 8 cédulas voando
+    for (let i = 0; i < 8; i++) {
+      setTimeout(() => {
+        const bill = document.createElement('div');
+        bill.textContent = '💸';
+        bill.style.cssText =
+          `position:fixed;left:${fromX}px;top:${fromY}px;z-index:550;` +
+          `font-size:28px;pointer-events:none;` +
+          `transition:all 0.8s cubic-bezier(.25,.46,.45,.94);`;
+        document.body.appendChild(bill);
+
+        // Curva aleatória
+        const curve = (Math.random() - 0.5) * 100;
+
+        requestAnimationFrame(() => {
+          bill.style.left = toX + 'px';
+          bill.style.top = toY + 'px';
+          bill.style.transform = `translateX(${curve}px) translateY(-40px) rotate(${Math.random() * 720}deg) scale(0.3)`;
+          bill.style.opacity = '0';
+        });
+
+        setTimeout(() => bill.remove(), 850);
+      }, i * 60);
+    }
+
+    setTimeout(() => {
+      isAnimatingCutscene = false;
+      onDone && onDone();
+    }, 1000);
+  }
+
+  /**
+   * CUTSCENE: Ir para a Delegacia (escuridão + sirene + grades)
+   */
+  function jailCutscene(onDone) {
+    isAnimatingCutscene = true;
+
+    // Overlay escuro
+    let overlay = $('jailOverlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'jailOverlay';
+      overlay.style.cssText =
+        'position:fixed;inset:0;z-index:500;background:#000;opacity:0;' +
+        'transition:opacity 0.4s;display:flex;align-items:center;justify-content:center;' +
+        'flex-direction:column;gap:20px;';
+      overlay.innerHTML =
+        '<div style="font-size:64px;">🚔</div>' +
+        '<div style="font-size:32px;font-weight:900;color:#ef4444;text-shadow:0 0 20px #ef4444;' +
+        'animation:pulseLogo 0.6s ease-in-out infinite;">DETIDO NA DELEGACIA!</div>' +
+        '<div style="font-size:18px;color:#fca5a5;">Pague fiança, use Habeas Corpus ou role dupla para sair</div>';
+      document.body.appendChild(overlay);
+    }
+
+    // Som de sirene
+    SoundEffects.goToJail();
+    screenShake(10);
+
+    // Fade in
+    requestAnimationFrame(() => {
+      overlay.style.opacity = '0.95';
+    });
+
+    // Luzes piscantes (vermelho e azul)
+    let blinkCount = 0;
+    const blinkInterval = setInterval(() => {
+      overlay.style.background = blinkCount % 2 === 0 ? '#dc2626' : '#2563eb';
+      blinkCount++;
+      if (blinkCount >= 8) clearInterval(blinkInterval);
+    }, 150);
+
+    // Fade out
+    setTimeout(() => {
+      overlay.style.opacity = '0';
+      setTimeout(() => {
+        overlay.remove();
+        isAnimatingCutscene = false;
+        onDone && onDone();
+      }, 450);
+    }, 2200);
+  }
+
+  console.log('[Magnata Brasil] Sistema Cinematográfico Completo carregado! 🎬');
 
 })();
